@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-dump1090 → GDL90 Bridge
+readsb → GDL90 Bridge
 ========================
-Reads SBS-1/BaseStation data from dump1090 on TCP port 30003 and broadcasts
-GDL90 Heartbeat + Traffic Report messages over UDP port 4000 for aviation
+Reads aircraft data from readsb's aircraft.json and broadcasts GDL90
+Heartbeat + Traffic Report messages over UDP port 4000 for aviation
 EFBs such as SkyDemon, ForeFlight, etc.
 
 Requires only the Python standard library.
 """
 
+import json
 import os
 import socket
 import sqlite3
@@ -19,8 +20,8 @@ import time
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DUMP1090_HOST = "127.0.0.1"
-DUMP1090_PORT = 30003
+READSB_JSON_PATH = "/run/readsb/aircraft.json"
+READSB_POLL_INTERVAL = 1.0  # seconds between aircraft.json reads
 GDL90_UDP_PORT = 4000
 GDL90_BROADCAST_ADDR = "255.255.255.255"
 AIRCRAFT_TIMEOUT = 60  # seconds before an aircraft is expired
@@ -607,57 +608,67 @@ def _lookup_aircraft(icao: str) -> tuple[str, int]:
 
 
 # ---------------------------------------------------------------------------
+# ADS-B Category → GDL90 Emitter Category mapping
+# ---------------------------------------------------------------------------
+_ADS_CAT_MAP: dict[str, int] = {
+    "A1": 0x01,  # Light (< 15,500 lbs)
+    "A2": 0x02,  # Small (15,500 – 75,000 lbs)
+    "A3": 0x03,  # Large (75,000 – 300,000 lbs)
+    "A4": 0x04,  # High vortex large (e.g. B757)
+    "A5": 0x05,  # Heavy (> 300,000 lbs)
+    "A6": 0x06,  # High performance (> 5G, > 400 kt)
+    "A7": 0x07,  # Rotorcraft
+    "B1": 0x09,  # Glider / sailplane
+    "B2": 0x0A,  # Lighter-than-air
+    "B4": 0x0B,  # Ultralight
+    "B6": 0x0E,  # Unmanned aerial vehicle
+}
+
+# ---------------------------------------------------------------------------
 # Aircraft State Tracking
 # ---------------------------------------------------------------------------
 _aircraft: dict[str, dict] = {}
 _aircraft_lock = threading.Lock()
 
 
-def _parse_sbs_line(line: str) -> None:
-    """
-    Parse one CSV line in SBS-1 / BaseStation format and update the aircraft
-    dictionary.  dump1090 emits 22 comma-separated fields per MSG line:
-
-      Field  0 : Message type  ("MSG")
-      Field  1 : Transmission type (1-8)
-      Field  4 : Hex ICAO address
-      Field 10 : Callsign
-      Field 11 : Altitude (ft, pressure)
-      Field 12 : Ground speed (kt)
-      Field 13 : Track (°)
-      Field 14 : Latitude
-      Field 15 : Longitude
-      Field 16 : Vertical rate (ft/min)
-    """
-    parts = line.strip().split(",")
-    if len(parts) < 22 or parts[0] != "MSG":
+def _read_readsb_json() -> None:
+    """Read /run/readsb/aircraft.json and update the aircraft dictionary."""
+    try:
+        with open(READSB_JSON_PATH, "r") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return
 
-    icao = parts[4].strip().upper()
-    if not icao:
-        return
-
+    now = time.time()
     with _aircraft_lock:
-        ac = _aircraft.setdefault(icao, {})
-        ac["last_seen"] = time.time()
+        for entry in data.get("aircraft", []):
+            icao = entry.get("hex", "").strip().upper()
+            if not icao:
+                continue
 
-        def _try_float(idx: int, key: str) -> None:
-            val = parts[idx].strip()
-            if val:
-                try:
-                    ac[key] = float(val)
-                except ValueError:
-                    pass
+            ac = _aircraft.setdefault(icao, {})
+            ac["last_seen"] = now
 
-        if parts[10].strip():
-            ac["callsign"] = parts[10].strip()
+            if "lat" in entry and "lon" in entry:
+                ac["latitude"] = entry["lat"]
+                ac["longitude"] = entry["lon"]
+            if "alt_baro" in entry and entry["alt_baro"] != "ground":
+                ac["altitude"] = entry["alt_baro"]
+            if "gs" in entry:
+                ac["ground_speed"] = entry["gs"]
+            if "track" in entry:
+                ac["track"] = entry["track"]
+            if "baro_rate" in entry:
+                ac["vertical_rate"] = entry["baro_rate"]
+            if "flight" in entry:
+                ac["flight"] = entry["flight"].strip()
+            if "category" in entry:
+                ac["cat"] = _ADS_CAT_MAP.get(entry["category"], 0)
 
-        _try_float(11, "altitude")
-        _try_float(12, "ground_speed")
-        _try_float(13, "track")
-        _try_float(14, "latitude")
-        _try_float(15, "longitude")
-        _try_float(16, "vertical_rate")
+            # Registration lookup (cached — only queries SQLite once per ICAO)
+            if "reg" not in ac:
+                reg, _ = _lookup_aircraft(icao)
+                ac["reg"] = reg
 
 
 def _expire_aircraft() -> None:
@@ -673,41 +684,17 @@ def _expire_aircraft() -> None:
 # Threads
 # ---------------------------------------------------------------------------
 
-def _sbs_reader() -> None:
-    """Continuously read SBS-1 data from dump1090, reconnecting on failure."""
+def _readsb_reader() -> None:
+    """Poll /run/readsb/aircraft.json and update the aircraft dictionary."""
+    print(f"[READSB] Reading from {READSB_JSON_PATH}")
     while True:
-        sock = None
+        _read_readsb_json()
         try:
-            print(f"[SBS] Connecting to {DUMP1090_HOST}:{DUMP1090_PORT} ...")
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(10)
-            sock.connect((DUMP1090_HOST, DUMP1090_PORT))
-            sock.settimeout(None)
-            print("[SBS] Connected.")
-
-            buf = ""
-            while True:
-                data = sock.recv(4096)
-                if not data:
-                    raise ConnectionError("dump1090 closed the connection")
-                buf += data.decode("ascii", errors="replace")
-                while "\n" in buf:
-                    line, buf = buf.split("\n", 1)
-                    _parse_sbs_line(line)
-                    try:
-                        with open("/tmp/adsb_heartbeat", "w") as f:
-                            f.write(str(time.time()))
-                    except Exception:
-                        pass
-
-        except Exception as exc:
-            print(f"[SBS] {exc}  — reconnecting in 5 s …")
-            if sock:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-            time.sleep(5)
+            with open("/tmp/adsb_heartbeat", "w") as f:
+                f.write(str(time.time()))
+        except Exception:
+            pass
+        time.sleep(READSB_POLL_INTERVAL)
 
 
 def _traffic_thread() -> None:
@@ -741,15 +728,8 @@ def _traffic_thread() -> None:
                         continue
 
                     # Prefer registration over flight number for GA use
-                    reg = ac.get("_reg", "")
-                    emitter_cat = ac.get("_cat", -1)
-                    if not reg or emitter_cat < 0:
-                        reg, emitter_cat = _lookup_aircraft(icao)
-                        with _aircraft_lock:
-                            if icao in _aircraft:
-                                _aircraft[icao]["_reg"] = reg
-                                _aircraft[icao]["_cat"] = emitter_cat
-                    callsign = (reg or ac.get("callsign", ""))
+                    callsign = ac.get("reg") or ac.get("flight", "")
+                    emitter_cat = ac.get("cat", 0)
 
                     pkt = _make_traffic_report(
                         icao_hex=icao,
@@ -787,8 +767,8 @@ def _traffic_thread() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    print("dump1090 → GDL90 bridge")
-    print(f"  SBS-1 source : tcp://{DUMP1090_HOST}:{DUMP1090_PORT}")
+    print("readsb → GDL90 bridge")
+    print(f"  readsb JSON  : {READSB_JSON_PATH}")
     print(f"  GDL90 output : udp://{GDL90_BROADCAST_ADDR}:{GDL90_UDP_PORT}")
     print(f"  NMEA input   : udp://{NMEA_HOST}:{NMEA_UDP_PORT}")
     print()
@@ -796,7 +776,7 @@ def main() -> None:
     _open_reg_db()
 
     for target, name in [
-        (_sbs_reader, "sbs-reader"),
+        (_readsb_reader, "readsb-reader"),
         (_nmea_listener, "nmea-listener"),
         (_traffic_thread, "gdl90-traffic"),
     ]:
