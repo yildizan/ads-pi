@@ -1,0 +1,773 @@
+#!/usr/bin/env python3
+"""
+dump1090 → GDL90 Bridge
+========================
+Reads SBS-1/BaseStation data from dump1090 on TCP port 30003 and broadcasts
+GDL90 Heartbeat + Traffic Report messages over UDP port 4000 for aviation
+EFBs such as SkyDemon, ForeFlight, etc.
+
+Requires only the Python standard library.
+"""
+
+import socket
+import struct
+import threading
+import time
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+DUMP1090_HOST = "127.0.0.1"
+DUMP1090_PORT = 30003
+GDL90_UDP_PORT = 4000
+GDL90_BROADCAST_ADDR = "255.255.255.255"
+AIRCRAFT_TIMEOUT = 60  # seconds before an aircraft is expired
+NMEA_HOST = "0.0.0.0"
+NMEA_UDP_PORT = 3999                # UDP port for NMEA from GPS2IP Lite
+
+# Ownship fallback position — used until first NMEA fix arrives
+_OWNSHIP_DEFAULT_LAT = 0.0
+_OWNSHIP_DEFAULT_LON = 0.0
+_OWNSHIP_DEFAULT_ALT = 0.0
+
+OWNSHIP_CALLSIGN = "OWNSHIP "
+
+# ---------------------------------------------------------------------------
+# Mutable ownship state (updated by NMEA listener thread)
+# ---------------------------------------------------------------------------
+_ownship_lock = threading.Lock()
+_ownship = {
+    "lat": _OWNSHIP_DEFAULT_LAT,
+    "lon": _OWNSHIP_DEFAULT_LON,
+    "alt_ft": _OWNSHIP_DEFAULT_ALT,
+    "alt_geo_ft": _OWNSHIP_DEFAULT_ALT,
+    "track_deg": None,
+    "speed_kt": None,
+    "heading_deg": None,
+    "has_fix": False,
+}
+
+# ---------------------------------------------------------------------------
+# GDL90 CRC-16  (CRC-CCITT, polynomial 0x1021, initial value 0x0000)
+# ---------------------------------------------------------------------------
+# The GDL90 ICD specifies a CRC-CCITT calculated over every byte of the
+# message (including Message ID) before byte-stuffing.  The 16-bit result
+# is appended in **little-endian** order (LSB first).
+
+_CRC_TABLE: list[int] = []
+
+
+def _init_crc_table() -> None:
+    """Pre-compute the 256-entry CRC-CCITT lookup table."""
+    for i in range(256):
+        crc = i << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021 if crc & 0x8000 else crc << 1) & 0xFFFF
+        _CRC_TABLE.append(crc)
+
+
+_init_crc_table()
+
+
+def _gdl90_crc(data: bytes) -> bytes:
+    crc = 0
+    for b in data:
+        m = (crc << 8) & 0xFFFF
+        crc = _CRC_TABLE[(crc >> 8)] ^ m ^ b
+    
+    # The spec requires the CRC appended LSB first
+    return bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+
+
+# ---------------------------------------------------------------------------
+# GDL90 Byte Stuffing & Framing
+# ---------------------------------------------------------------------------
+# Every GDL90 frame is delimited by 0x7E flag bytes.  Inside the frame the
+# bytes 0x7E and 0x7D are escaped: replace with 0x7D followed by the
+# original byte XOR'd with 0x20.
+
+_FLAG = 0x7E
+_ESCAPE = 0x7D
+
+
+def _byte_stuff(data: bytes) -> bytes:
+    """Apply GDL90 byte-stuffing to *data*."""
+    out = bytearray()
+    for b in data:
+        if b == _FLAG or b == _ESCAPE:
+            out.append(_ESCAPE)
+            out.append(b ^ 0x20)
+        else:
+            out.append(b)
+    return bytes(out)
+
+
+def _gdl90_frame(payload: bytes) -> bytes:
+    # Use the new CRC function that returns bytes directly
+    raw = payload + _gdl90_crc(payload)
+    return bytes([_FLAG]) + _byte_stuff(raw) + bytes([_FLAG])
+
+
+# ---------------------------------------------------------------------------
+# GDL90 Heartbeat  (Message ID 0x00, 7 bytes before CRC)
+# ---------------------------------------------------------------------------
+#   Byte  0  : Message ID = 0x00
+#   Byte  1  : Status Byte 1
+#                Bit 7 – GPS Position Valid
+#                Bit 0 – UAT Initialized
+#   Byte  2  : Status Byte 2
+#                Bit 7 – Time Stamp MSBit (bit 16 of seconds since midnight)
+#   Bytes 3-4: Time Stamp lower 16 bits (seconds since 0000 UTC)
+#   Bytes 5-6: Message Counts (UAT upper byte, ADS-B lower byte)
+
+def _make_heartbeat() -> bytes:
+    ts = (int(time.time()) % 86400)
+    st1 = 0x81
+    st2 = 0x01  # Bit 0 is 'UTC OK'. SkyDemon NEEDS this set to 1.
+    
+    ts_msb = (ts & 0x10000) >> 16
+    st2 = (st2 & 0x7F) | (ts_msb << 7)
+    ts_lo = ts & 0xFFFF
+
+    # IMPORTANT: The timestamp here is often packed LITTLE-ENDIAN in many GDL90 units
+    # but the heartbeat ID 0x00 is packed as: ID, ST1, ST2, TS(Low), Count
+    msg = struct.pack('<BBBHH', 0x00, st1, st2, ts_lo, 0x0000)
+    return _gdl90_frame(msg)
+
+
+# ---------------------------------------------------------------------------
+# GDL90 Traffic Report  (Message ID 0x14, 28 bytes before CRC)
+# ---------------------------------------------------------------------------
+#   Byte  0     : Message ID = 0x14
+#   Byte  1     : [7:4] Alert Status  (0 = no alert)
+#                 [3:0] Address Type   (0 = ADS-B with ICAO address)
+#   Bytes 2-4   : Participant Address  (24-bit ICAO)
+#   Bytes 5-7   : Latitude  (24-bit signed, resolution = 180 / 2^23 °)
+#   Bytes 8-10  : Longitude (24-bit signed, resolution = 180 / 2^23 °)
+#   Bytes 11-12 : [15:4] Altitude (12 bits, 25 ft per LSB, +1000 ft offset)
+#                 [3:0]  Misc indicators
+#                         Bits 3-2 : TT (track type) 01 = True Track Angle
+#                         Bit  1   : Report updated
+#                         Bit  0   : Airborne
+#   Byte  13    : [7:4] NIC   (Navigation Integrity Category)
+#                 [3:0] NACp  (Navigation Accuracy Category – Position)
+#   Bytes 14-16 : [23:12] Horizontal velocity (12 bits, knots, 0xFFF=invalid)
+#                 [11:0]  Vertical velocity   (12 bits signed, 64 fpm/LSB,
+#                          0x800 = not available)
+#   Byte  17    : Track / Heading (8 bits, 360/256 ° per LSB)
+#   Byte  18    : Emitter Category (0 = unknown)
+#   Bytes 19-26 : Callsign (8 ASCII chars, space-padded)
+#   Byte  27    : [7:4] Emergency/Priority Code  [3:0] Spare
+
+def _encode_lat_lon(deg: float) -> int:
+    """Encode a latitude or longitude into a 24-bit signed GDL90 value."""
+    enc = int(deg * (0x800000 / 180.0))
+    enc = max(-0x800000, min(0x7FFFFF, enc))
+    return enc & 0xFFFFFF                   # two's complement 24-bit
+
+
+def _make_traffic_report(
+    icao_hex: str,
+    lat: float,
+    lon: float,
+    alt_ft: float | None,
+    speed_kt: float | None,
+    vrate_fpm: float | None,
+    track_deg: float | None,
+    callsign: str,
+) -> bytes:
+    """Build one GDL90 Traffic Report frame for the given aircraft."""
+    msg = bytearray(28)
+
+    # -- Byte 0: Message ID --------------------------------------------------
+    msg[0] = 0x14
+
+    # -- Byte 1: Alert Status (0) | Address Type (0 = ICAO / ADS-B) ----------
+    msg[1] = 0x00
+
+    # -- Bytes 2-4: Participant Address (24-bit ICAO) -------------------------
+    addr = int(icao_hex, 16) & 0xFFFFFF
+    msg[2] = (addr >> 16) & 0xFF
+    msg[3] = (addr >>  8) & 0xFF
+    msg[4] = addr & 0xFF
+
+    # -- Bytes 5-7: Latitude --------------------------------------------------
+    lat_enc = _encode_lat_lon(lat)
+    msg[5] = (lat_enc >> 16) & 0xFF
+    msg[6] = (lat_enc >>  8) & 0xFF
+    msg[7] = lat_enc & 0xFF
+
+    # -- Bytes 8-10: Longitude ------------------------------------------------
+    lon_enc = _encode_lat_lon(lon)
+    msg[8]  = (lon_enc >> 16) & 0xFF
+    msg[9]  = (lon_enc >>  8) & 0xFF
+    msg[10] = lon_enc & 0xFF
+
+    # -- Bytes 11-12: Altitude (12 bits) | Misc (4 bits) ---------------------
+    if alt_ft is not None:
+        alt_enc = int((alt_ft + 1000) / 25)
+        alt_enc = max(0, min(0xFFE, alt_enc))
+    else:
+        alt_enc = 0xFFF                     # invalid / not available
+
+    # Misc nibble: TT=01 (true track), report updated=1, airborne=1 → 0b0111
+    misc = 0x07
+    msg[11] = (alt_enc >> 4) & 0xFF
+    msg[12] = ((alt_enc & 0x0F) << 4) | (misc & 0x0F)
+
+    # -- Byte 13: NIC (4 bits) | NACp (4 bits) --------------------------------
+    msg[13] = 0x88                          # NIC=8, NACp=8 (reasonable default)
+
+    # -- Bytes 14-16: Horizontal velocity (12 bits) | Vertical velocity (12) --
+    if speed_kt is not None:
+        hvel = max(0, min(0xFFE, int(speed_kt)))
+    else:
+        hvel = 0xFFF                        # invalid
+
+    if vrate_fpm is not None:
+        vvel = int(vrate_fpm / 64)
+        vvel = max(-510, min(510, vvel))
+        if vvel < 0:
+            vvel += 0x1000                  # 12-bit two's complement
+    else:
+        vvel = 0x800                        # not available
+
+    packed_vel = ((hvel & 0xFFF) << 12) | (vvel & 0xFFF)
+    msg[14] = (packed_vel >> 16) & 0xFF
+    msg[15] = (packed_vel >>  8) & 0xFF
+    msg[16] = packed_vel & 0xFF
+
+    # -- Byte 17: Track / Heading ---------------------------------------------
+    if track_deg is not None:
+        msg[17] = int(track_deg * 256 / 360) & 0xFF
+    else:
+        msg[17] = 0
+
+    # -- Byte 18: Emitter Category (0 = unknown) ------------------------------
+    msg[18] = 0x00
+
+    # -- Bytes 19-26: Callsign (8 chars, space-padded) ------------------------
+    cs = (callsign or "").ljust(8)[:8].encode("ascii", errors="replace")
+    msg[19:27] = cs
+
+    # -- Byte 27: Emergency/Priority (4 bits) | Spare (4 bits) ----------------
+    msg[27] = 0x00
+
+    return _gdl90_frame(bytes(msg))
+
+
+# ---------------------------------------------------------------------------
+# GDL90 Ownship Report  (Message ID 0x0A, 28 bytes before CRC)
+# ---------------------------------------------------------------------------
+# Identical layout to Traffic Report (0x14) but uses Message ID 0x0A.
+# This tells the EFB where *we* are so it can centre the map and stop
+# showing "Seeking Satellites".
+
+def _make_ownship_report() -> bytes:
+    """Build one GDL90 Ownship Report frame using the current ownship position."""
+    with _ownship_lock:
+        lat = _ownship["lat"]
+        lon = _ownship["lon"]
+        alt_ft = _ownship["alt_ft"]
+        track_deg = _ownship["track_deg"]
+        speed_kt = _ownship["speed_kt"]
+        heading_deg = _ownship["heading_deg"]
+
+    msg = bytearray(28)
+
+    # -- Byte 0: Message ID = 0x0A (Ownship Report) --------------------------
+    msg[0] = 0x0A
+
+    # -- Byte 1: Alert Status (0) | Address Type (0 = ADS-B / ICAO) ----------
+    msg[1] = 0x00
+
+    # -- Bytes 2-4: Participant Address (dummy non-zero ICAO for ownship) -----
+    #    Some EFBs treat 0x000000 as invalid / no-fix, so use 0xF00001.
+    msg[2] = 0xF0
+    msg[3] = 0x00
+    msg[4] = 0x01
+
+    # -- Bytes 5-7: Latitude --------------------------------------------------
+    lat_enc = _encode_lat_lon(lat)
+    msg[5] = (lat_enc >> 16) & 0xFF
+    msg[6] = (lat_enc >>  8) & 0xFF
+    msg[7] = lat_enc & 0xFF
+
+    # -- Bytes 8-10: Longitude ------------------------------------------------
+    lon_enc = _encode_lat_lon(lon)
+    msg[8]  = (lon_enc >> 16) & 0xFF
+    msg[9]  = (lon_enc >>  8) & 0xFF
+    msg[10] = lon_enc & 0xFF
+
+    # -- Bytes 11-12: Altitude (12 bits) | Misc (4 bits) ---------------------
+    # GPS MSL altitude — not true pressure altitude but closest available
+    # without a barometric sensor
+    alt_enc = int((alt_ft + 1000) / 25)
+    alt_enc = max(0, min(0xFFE, alt_enc))
+    # Decide which direction source to use:
+    # - Moving (speed > 2 kt): use GPS track (reliable)
+    # - Stationary: fall back to HDT compass heading
+    _moving = speed_kt is not None and speed_kt > 2.0
+    if _moving and track_deg is not None:
+        use_deg = track_deg
+        tt_bits = 0x01  # True Track Angle
+    elif heading_deg is not None:
+        use_deg = heading_deg
+        tt_bits = 0x02  # Heading
+    else:
+        use_deg = None
+        tt_bits = 0x00  # Not available
+
+    # Misc TT field:
+    #   Bit 3-2: TT    Bit 1: report updated    Bit 0: airborne
+    misc = (tt_bits << 2) | 0x03  # updated=1, airborne=1
+    msg[11] = (alt_enc >> 4) & 0xFF
+    msg[12] = ((alt_enc & 0x0F) << 4) | (misc & 0x0F)
+
+    # -- Byte 13: NIC=8 | NACp=8 (reference default) -------------------------
+    msg[13] = 0x88
+
+    # -- Bytes 14-16: Horizontal velocity (12 bits) | Vertical velocity (12) -
+    if speed_kt is not None:
+        hvel = max(0, min(0xFFE, int(speed_kt)))
+    else:
+        hvel = 0xFFF                        # not available
+    vvel = 0x800                            # vertical rate not available from GPS
+    packed_vel = ((hvel & 0xFFF) << 12) | (vvel & 0xFFF)
+    msg[14] = (packed_vel >> 16) & 0xFF
+    msg[15] = (packed_vel >>  8) & 0xFF
+    msg[16] = packed_vel & 0xFF
+
+    # -- Byte 17: Track / Heading ---------------------------------------------
+    if use_deg is not None:
+        msg[17] = int(use_deg * 256 / 360) & 0xFF
+    else:
+        msg[17] = 0x00
+
+    # -- Byte 18: Emitter Category (1 = Light Aircraft) ----------------------
+    msg[18] = 0x01
+
+    # -- Bytes 19-26: Callsign (8 chars, space-padded) ------------------------
+    cs = OWNSHIP_CALLSIGN.ljust(8)[:8].encode("ascii", errors="replace")
+    msg[19:27] = cs
+
+    # -- Byte 27: Emergency/Priority (4 bits) | Spare (4 bits) ----------------
+    msg[27] = 0x00
+
+    return _gdl90_frame(bytes(msg))
+
+
+# ---------------------------------------------------------------------------
+# GDL90 GPS Time / SkyRadar  (Message ID 0x65)
+# ---------------------------------------------------------------------------
+# This is a Stratux-style GPS quality message used by SkyDemon to
+# transition from "Seeking GPS Satellites" to a locked position.
+# Actual layout (12 bytes before CRC):
+#   Byte  0     : Message ID = 0x65 (101)
+#   Byte  1     : Firmware version (0x2A)
+#   Byte  2     : Debug (0x00)
+#   Byte  3     : GPS fix quality (0x30 + fix type)
+#   Bytes 4-6   : Milliseconds since midnight (3 bytes, little-endian)
+#   Byte  7     : UTC hour
+#   Byte  8     : UTC minute
+#   Byte  9     : Debug (0x00)
+#   Byte  10    : Debug (0x00)
+#   Byte  11    : Hardware version (0x04)
+
+def _make_gps_time() -> bytes:
+    """Build a GDL90 Message 0x65 (GPS Time/Quality) integer-based frame."""
+    now = time.gmtime()
+
+    # Quality: 0x30 + 2 = '2' (DGPS/WAAS)
+    quality = (0x30 + 2) & 0xFF
+    
+    msg = bytearray([0x65])
+    msg.append(0x2A)  # Firmware version
+    msg.append(0x00)  # Debug
+    msg.append(quality) 
+    
+    # 3-byte count (ms since start of day or similar)
+    count = (now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec) * 1000
+    msg.extend(struct.pack('<I', count)[:3]) 
+    
+    msg.append(now.tm_hour & 0xFF)
+    msg.append(now.tm_min & 0xFF)
+    msg.append(0x00) # Debug
+    msg.append(0x00) # Debug
+    msg.append(0x04) # Hardware version
+    
+    return _gdl90_frame(bytes(msg))
+
+
+# ---------------------------------------------------------------------------
+# GDL90 Ownship Geometric Altitude  (Message ID 0x0B, 5 bytes before CRC)
+# ---------------------------------------------------------------------------
+#   Byte  0  : Message ID = 0x0B
+#   Bytes 1-2: Geometric altitude (16-bit signed, 5 ft per LSB)
+#   Bytes 3-4: Vertical figure of merit / vertical warning indicator
+#              Bit  [15]   : Vertical Warning Indicator (0 = no warning)
+#              Bits [14:0] : VFOM in metres (0x7FFF = not available)
+
+def _make_ownship_geo_alt() -> bytes:
+    """Build one GDL90 Ownship Geometric Altitude frame."""
+    with _ownship_lock:
+        alt_geo_ft = _ownship["alt_geo_ft"]
+
+    geo_enc = int(alt_geo_ft / 5)
+    geo_enc = max(-32768, min(32767, geo_enc))
+
+    # VFOM: no warning, merit = 10 m (arbitrary small value)
+    vfom = 10 & 0x7FFF
+
+    msg = struct.pack(">BhH", 0x0B, geo_enc, vfom)
+    return _gdl90_frame(msg)
+
+
+# ---------------------------------------------------------------------------
+# NMEA Parser & Listener  (GPS2IP Lite over UDP)
+# ---------------------------------------------------------------------------
+
+def _nmea_checksum_ok(sentence: str) -> bool:
+    """Verify the NMEA XOR checksum (*HH at end)."""
+    if "*" not in sentence:
+        return False
+    body, cksum_hex = sentence.rsplit("*", 1)
+    body = body.lstrip("$")
+    calc = 0
+    for ch in body:
+        calc ^= ord(ch)
+    try:
+        return calc == int(cksum_hex[:2], 16)
+    except ValueError:
+        return False
+
+
+def _nmea_coord(raw: str, hemi: str) -> float | None:
+    """Convert NMEA ddmm.mmmm / dddmm.mmmm + hemisphere to decimal degrees."""
+    if not raw or not hemi:
+        return None
+    try:
+        dot = raw.index(".")
+        deg = int(raw[:dot - 2])
+        minutes = float(raw[dot - 2:])
+        dec = deg + minutes / 60.0
+        if hemi in ("S", "W"):
+            dec = -dec
+        return dec
+    except (ValueError, IndexError):
+        return None
+
+
+def _parse_nmea(sentence: str) -> None:
+    """
+    Parse a $GPGGA or $GPRMC (or $GNGGA / $GNRMC) sentence and update
+    the mutable ownship state.
+    """
+    sentence = sentence.strip()
+    if not sentence.startswith("$"):
+        return
+    if not _nmea_checksum_ok(sentence):
+        return
+
+    fields = sentence.split(",")
+    msg_type = fields[0]  # e.g. $GPGGA, $GNGGA, $GPRMC, $GNRMC
+
+    if msg_type in ("$GPGGA", "$GNGGA"):
+        # $GPGGA,hhmmss.ss,lat,N/S,lon,E/W,fix,sats,hdop,alt,M,...
+        if len(fields) < 10:
+            return
+        lat = _nmea_coord(fields[2], fields[3])
+        lon = _nmea_coord(fields[4], fields[5])
+        alt_m_str = fields[9]
+        if lat is None or lon is None:
+            return
+        alt_ft = 0.0
+        if alt_m_str:
+            try:
+                alt_ft = float(alt_m_str) * 3.28084  # metres → feet
+            except ValueError:
+                pass
+        with _ownship_lock:
+            _ownship["lat"] = lat
+            _ownship["lon"] = lon
+            _ownship["alt_ft"] = alt_ft
+            _ownship["alt_geo_ft"] = alt_ft
+            _ownship["has_fix"] = True
+
+    elif msg_type in ("$GPRMC", "$GNRMC"):
+        # $GPRMC,hhmmss.ss,A,lat,N/S,lon,E/W,speed,course,ddmmyy,...
+        if len(fields) < 9:
+            return
+        status = fields[2]
+        if status != "A":  # A = Active (valid fix)
+            return
+        lat = _nmea_coord(fields[3], fields[4])
+        lon = _nmea_coord(fields[5], fields[6])
+        if lat is None or lon is None:
+            return
+        speed_kt = None
+        track_deg = None
+        if fields[7].strip():
+            try:
+                speed_kt = float(fields[7])
+            except ValueError:
+                pass
+        if fields[8].strip():
+            try:
+                track_deg = float(fields[8])
+            except ValueError:
+                pass
+        with _ownship_lock:
+            _ownship["lat"] = lat
+            _ownship["lon"] = lon
+            _ownship["speed_kt"] = speed_kt
+            _ownship["track_deg"] = track_deg
+            _ownship["has_fix"] = True
+
+    elif msg_type in ("$GPHDT", "$GNHDT"):
+        # $GPHDT,heading,T*checksum
+        if len(fields) < 2:
+            return
+        hdg_str = fields[1].strip()
+        if hdg_str:
+            try:
+                with _ownship_lock:
+                    _ownship["heading_deg"] = float(hdg_str)
+            except ValueError:
+                pass
+
+
+def _nmea_listener() -> None:
+    """Listen for NMEA sentences on UDP and update ownship position."""
+    while True:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.bind((NMEA_HOST, NMEA_UDP_PORT))
+            print(f"[NMEA] Listening on udp://{NMEA_HOST}:{NMEA_UDP_PORT}")
+
+            while True:
+                data, _ = sock.recvfrom(4096)
+                text = data.decode("ascii", errors="replace")
+                for line in text.splitlines():
+                    _parse_nmea(line)
+                    try:
+                        with open("/tmp/gps_heartbeat", "w") as f:
+                            f.write(str(time.time()))
+                    except Exception:
+                        pass
+        except Exception as exc:
+            print(f"[NMEA] {exc} — restarting in 5 s …")
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            time.sleep(5)
+
+
+# ---------------------------------------------------------------------------
+# Aircraft State Tracking
+# ---------------------------------------------------------------------------
+_aircraft: dict[str, dict] = {}
+_aircraft_lock = threading.Lock()
+
+
+def _parse_sbs_line(line: str) -> None:
+    """
+    Parse one CSV line in SBS-1 / BaseStation format and update the aircraft
+    dictionary.  dump1090 emits 22 comma-separated fields per MSG line:
+
+      Field  0 : Message type  ("MSG")
+      Field  1 : Transmission type (1-8)
+      Field  4 : Hex ICAO address
+      Field 10 : Callsign
+      Field 11 : Altitude (ft, pressure)
+      Field 12 : Ground speed (kt)
+      Field 13 : Track (°)
+      Field 14 : Latitude
+      Field 15 : Longitude
+      Field 16 : Vertical rate (ft/min)
+    """
+    parts = line.strip().split(",")
+    if len(parts) < 22 or parts[0] != "MSG":
+        return
+
+    icao = parts[4].strip().upper()
+    if not icao:
+        return
+
+    with _aircraft_lock:
+        ac = _aircraft.setdefault(icao, {})
+        ac["last_seen"] = time.time()
+
+        def _try_float(idx: int, key: str) -> None:
+            val = parts[idx].strip()
+            if val:
+                try:
+                    ac[key] = float(val)
+                except ValueError:
+                    pass
+
+        if parts[10].strip():
+            ac["callsign"] = parts[10].strip()
+
+        _try_float(11, "altitude")
+        _try_float(12, "ground_speed")
+        _try_float(13, "track")
+        _try_float(14, "latitude")
+        _try_float(15, "longitude")
+        _try_float(16, "vertical_rate")
+
+
+def _expire_aircraft() -> None:
+    """Remove aircraft not seen for AIRCRAFT_TIMEOUT seconds."""
+    cutoff = time.time() - AIRCRAFT_TIMEOUT
+    with _aircraft_lock:
+        stale = [k for k, v in _aircraft.items() if v.get("last_seen", 0) < cutoff]
+        for k in stale:
+            del _aircraft[k]
+
+
+# ---------------------------------------------------------------------------
+# Threads
+# ---------------------------------------------------------------------------
+
+def _sbs_reader() -> None:
+    """Continuously read SBS-1 data from dump1090, reconnecting on failure."""
+    while True:
+        sock = None
+        try:
+            print(f"[SBS] Connecting to {DUMP1090_HOST}:{DUMP1090_PORT} ...")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect((DUMP1090_HOST, DUMP1090_PORT))
+            sock.settimeout(None)
+            print("[SBS] Connected.")
+
+            buf = ""
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    raise ConnectionError("dump1090 closed the connection")
+                buf += data.decode("ascii", errors="replace")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    _parse_sbs_line(line)
+                    try:
+                        with open("/tmp/adsb_heartbeat", "w") as f:
+                            f.write(str(time.time()))
+                    except Exception:
+                        pass
+
+        except Exception as exc:
+            print(f"[SBS] {exc}  — reconnecting in 5 s …")
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            time.sleep(5)
+
+
+def _traffic_thread() -> None:
+    """Broadcast Ownship + Traffic Reports for all tracked aircraft at ~1 Hz."""
+    while True:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            dest = (GDL90_BROADCAST_ADDR, GDL90_UDP_PORT)
+
+            while True:
+                _expire_aircraft()
+
+                # --- Core GDL90 sequence with 10 ms gaps to avoid UDP packet loss
+                sock.sendto(_make_heartbeat(), dest)
+                time.sleep(0.01)
+                sock.sendto(_make_gps_time(), dest)
+                time.sleep(0.01)
+                sock.sendto(_make_ownship_report(), dest)
+                time.sleep(0.01)
+                sock.sendto(_make_ownship_geo_alt(), dest)
+                time.sleep(0.01)
+
+                # --- Traffic reports for every tracked aircraft with position -
+                with _aircraft_lock:
+                    snapshot = {k: dict(v) for k, v in _aircraft.items()}
+
+                for icao, ac in snapshot.items():
+                    if "latitude" not in ac or "longitude" not in ac:
+                        continue
+
+                    pkt = _make_traffic_report(
+                        icao_hex=icao,
+                        lat=ac["latitude"],
+                        lon=ac["longitude"],
+                        alt_ft=ac.get("altitude"),
+                        speed_kt=ac.get("ground_speed"),
+                        vrate_fpm=ac.get("vertical_rate"),
+                        track_deg=ac.get("track"),
+                        callsign=ac.get("callsign", ""),
+                    )
+                    sock.sendto(pkt, dest)
+
+                # Write heartbeat timestamp for display flow monitor
+                try:
+                    with open("/tmp/gdl90_heartbeat", "w") as f:
+                        f.write(str(time.time()))
+                except Exception:
+                    pass
+
+                time.sleep(1)
+        except Exception as exc:
+            print(f"[GDL90] {exc} — restarting in 5 s …")
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            time.sleep(5)
+
+
+# ---------------------------------------------------------------------------
+# Entry Point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    print("dump1090 → GDL90 bridge")
+    print(f"  SBS-1 source : tcp://{DUMP1090_HOST}:{DUMP1090_PORT}")
+    print(f"  GDL90 output : udp://{GDL90_BROADCAST_ADDR}:{GDL90_UDP_PORT}")
+    print(f"  NMEA input   : udp://{NMEA_HOST}:{NMEA_UDP_PORT}")
+    print()
+
+    for target, name in [
+        (_sbs_reader, "sbs-reader"),
+        (_nmea_listener, "nmea-listener"),
+        (_traffic_thread, "gdl90-traffic"),
+    ]:
+        threading.Thread(target=target, name=name, daemon=True).start()
+
+    try:
+        while True:
+            time.sleep(60)
+            with _aircraft_lock:
+                n_total = len(_aircraft)
+                n_pos = sum(
+                    1 for ac in _aircraft.values()
+                    if "latitude" in ac and "longitude" in ac
+                )
+            print(f"[STATUS] Tracking {n_total} aircraft ({n_pos} with position)")
+            with _ownship_lock:
+                fix = "GPS" if _ownship["has_fix"] else "DEFAULT"
+                print(f"[STATUS] Ownship [{fix}]: "
+                      f"{_ownship['lat']:.6f}°N  {_ownship['lon']:.6f}°E  "
+                      f"{_ownship['alt_ft']:.0f} ft")
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+
+
+if __name__ == "__main__":
+    main()
