@@ -21,7 +21,9 @@ Inputs:
 Requires: spidev, RPi.GPIO, Pillow  (apt: python3-pil, pip: spidev)
 """
 
+import json
 import logging
+import math
 import os
 import signal
 import subprocess
@@ -99,6 +101,11 @@ COL_GREY       = (120, 120, 120)
 COL_HIGHLIGHT  = (50, 50, 180)
 COL_SECTION    = (80, 80, 80)
 COL_SOFTKEY_BG = (40, 40, 40)
+COL_RADAR_RING = (50, 50, 50)
+COL_RADAR_OWN  = (0, 180, 255)
+COL_BAND_RED   = (255, 60, 60)
+COL_BAND_YELLOW = (255, 200, 0)
+COL_BAND_WHITE = (200, 200, 200)
 
 # ---------------------------------------------------------------------------
 # ST7735S commands
@@ -502,14 +509,17 @@ SCREEN_STATUS  = 0
 SCREEN_POWER   = 1
 SCREEN_NETWORK = 2
 SCREEN_CONFIG  = 3
+SCREEN_RADAR   = 4
+
+RADAR_JSON_PATH = "/tmp/radar.json"
 
 POWER_SHUTDOWN = 0
 POWER_REBOOT   = 1
 
 # Config menu item indices
-CFG_POWER = 0
+CFG_THEME = 0
 CFG_WIFI  = 1
-CFG_THEME = 2
+CFG_POWER = 2
 _CFG_COUNT = 3
 _THEME_OPTIONS = ["dark", "light"]
 
@@ -557,6 +567,9 @@ class DisplayApp:
 
         # Redraw event — set when input received for instant redraw
         self._redraw_event = threading.Event()
+
+        # Last rendered frame for screenshots
+        self._last_frame: Image.Image | None = None
 
         # Running flag
         self._running = True
@@ -630,6 +643,14 @@ class DisplayApp:
             if self._debounced(PIN_KEY3):
                 self.screen = SCREEN_CONFIG
                 self._cfg_selection = 0
+                self._redraw_event.set()
+            elif self._debounced(PIN_JOY_UP) or self._debounced(PIN_JOY_DOWN):
+                self.screen = SCREEN_RADAR
+                self._redraw_event.set()
+
+        elif self.screen == SCREEN_RADAR:
+            if self._debounced(PIN_JOY_UP) or self._debounced(PIN_JOY_DOWN):
+                self.screen = SCREEN_STATUS
                 self._redraw_event.set()
 
         elif self.screen == SCREEN_CONFIG:
@@ -882,7 +903,7 @@ class DisplayApp:
             cx = x0 + self._SK_W // 2
             cy = i * strip_h + strip_h // 2
             if key_fn == "back":
-                draw.text((cx - 5, cy - 6), "\u2190", fill=COL_TEXT,
+                draw.text((cx - 5, cy - 6), "\u2190", fill=(255, 255, 255),
                           font=self._icon_font)
             elif key_fn == "lock":
                 col = COL_RED if self.locked else COL_GREEN
@@ -890,13 +911,13 @@ class DisplayApp:
                           "\U0001F512" if self.locked else "\U0001F513",
                           fill=col, font=self._icon_font)
             elif key_fn == "power":
-                draw.text((cx - 5, cy - 6), "\u23FB", fill=COL_TEXT,
+                draw.text((cx - 5, cy - 6), "\u23FB", fill=(255, 255, 255),
                           font=self._icon_font)
             elif key_fn == "wifi":
-                draw.text((cx - 5, cy - 6), "\U0001F310", fill=COL_TEXT,
+                draw.text((cx - 5, cy - 6), "\U0001F310", fill=(255, 255, 255),
                           font=self._icon_font)
             elif key_fn == "config":
-                draw.text((cx - 5, cy - 6), "\u2699", fill=COL_TEXT,
+                draw.text((cx - 5, cy - 6), "\u2699", fill=(255, 255, 255),
                           font=self._icon_font)
 
     # ── section header ─────────────────────────────────────────────────────
@@ -999,14 +1020,15 @@ class DisplayApp:
         draw.text((15, 20), "Config", fill=COL_YELLOW, font=self._font)
         draw.line([(5, 36), (cw - 5, 36)], fill=COL_GREY)
 
-        items = [
-            ("Power", ">"),
-            ("WiFi", ">"),
-        ]
         # Theme inline toggle — sun for light, moon for dark
         theme_val = self.cfg.get("display", "theme")
         theme_icon = "\u263E" if theme_val == "dark" else "\u2600"
-        items.append(("Theme", f"< {theme_icon} >"))
+
+        items = [
+            ("Theme", f"< {theme_icon} >"),
+            ("WiFi", ">"),
+            ("Power", ">"),
+        ]
 
         for i, (label, suffix) in enumerate(items):
             y = 46 + i * 22
@@ -1123,6 +1145,104 @@ class DisplayApp:
         # Soft keys: back | lock | (none)
         self._draw_softkeys(draw, "back", "lock", "")
 
+    # ── radar screen ─────────────────────────────────────────────────────────────────
+
+    _DIAMOND_SIZE = 3                    # half-size of traffic diamond
+
+    _BAND_COLOURS: dict[str, tuple] = {
+        "red": COL_BAND_RED,
+        "yellow": COL_BAND_YELLOW,
+        "white": COL_BAND_WHITE,
+    }
+
+    def _read_radar_json(self) -> dict | None:
+        try:
+            with open(RADAR_JSON_PATH, "r") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+
+    def _draw_radar(self, draw: ImageDraw.ImageDraw) -> None:
+        cx = LCD_WIDTH // 2
+        cy = LCD_HEIGHT // 2
+        r = 60                               # usable radius in pixels
+        ring_r = r // 2                      # 5 nm ring at half-radius
+        ds = self._DIAMOND_SIZE
+
+        # Range ring at 5 nm (half of 10 nm full radius)
+        draw.ellipse(
+            [(cx - ring_r, cy - ring_r), (cx + ring_r, cy + ring_r)],
+            outline=COL_RADAR_RING,
+        )
+        # Outer boundary (10 nm)
+        draw.ellipse(
+            [(cx - r, cy - r), (cx + r, cy + r)],
+            outline=COL_RADAR_RING,
+        )
+
+        # Cross-hair lines
+        draw.line([(cx, cy - r), (cx, cy + r)], fill=COL_RADAR_RING)
+        draw.line([(cx - r, cy), (cx + r, cy)], fill=COL_RADAR_RING)
+
+        # Range labels
+        draw.text((cx + ring_r + 1, cy - 4), "5", fill=COL_GREY, font=self._font_xs)
+        draw.text((cx + r + 1, cy - 4), "10", fill=COL_GREY, font=self._font_xs)
+
+        # North indicator
+        draw.text((cx - 3, 1), "N", fill=COL_GREY, font=self._font_xs)
+
+        radar = self._read_radar_json()
+        if radar is None or not radar.get("has_fix"):
+            draw.text((cx - 25, cy - 5), "NO GPS", fill=COL_RED, font=self._font)
+            return
+
+        own_track = radar.get("ownship_track") or 0.0
+
+        # Ownship marker (small filled circle)
+        draw.ellipse(
+            [(cx - 2, cy - 2), (cx + 2, cy + 2)],
+            fill=COL_RADAR_OWN,
+        )
+
+        # Traffic diamonds
+        for t in radar.get("traffic", []):
+            bearing = t.get("bearing", 0.0)
+            dist_nm = t.get("dist_nm", 0.0)
+            band = t.get("band", "white")
+
+            # Track-up rotation: subtract ownship track
+            rel_bearing = math.radians(bearing - own_track)
+
+            # Project to pixel coordinates (north = up = -y)
+            px_dist = (dist_nm / 10.0) * r
+            tx = cx + px_dist * math.sin(rel_bearing)
+            ty = cy - px_dist * math.cos(rel_bearing)
+
+            # Clamp to display bounds
+            tx = max(ds, min(LCD_WIDTH - 1 - ds, tx))
+            ty = max(ds, min(LCD_HEIGHT - 1 - ds, ty))
+
+            col = self._BAND_COLOURS.get(band, COL_BAND_WHITE)
+            ix, iy = int(tx), int(ty)
+
+            # Diamond shape (4 points)
+            diamond = [(ix, iy - ds), (ix + ds, iy), (ix, iy + ds), (ix - ds, iy)]
+            draw.polygon(diamond, fill=col)
+
+            # Altitude diff label: e.g. "+2,1" or "-1,8"
+            alt_diff = t.get("alt_diff_ft", 0)
+            alt_k = abs(alt_diff) / 1000.0
+            sign = "+" if alt_diff >= 0 else "-"
+            # European format: comma as decimal separator, 1 decimal
+            alt_label = f"{sign}{alt_k:.1f}".replace(".", ",")
+            draw.text((ix + ds + 2, iy - 5), alt_label,
+                      fill=col, font=self._font_xs)
+
+        # Lock indicator — small icon at bottom-right corner
+        if self.locked:
+            draw.text((LCD_WIDTH - 12, LCD_HEIGHT - 12), "\U0001F512",
+                      fill=COL_RED, font=self._icon_font_sm)
+
     def _render(self) -> None:
         if self._countdown_active:
             return
@@ -1138,8 +1258,18 @@ class DisplayApp:
             self._draw_power_menu(draw)
         elif self.screen == SCREEN_NETWORK:
             self._draw_network_menu(draw)
+        elif self.screen == SCREEN_RADAR:
+            self._draw_radar(draw)
 
+        self._last_frame = img
         self.lcd.show_image(img)
+
+    def save_screenshot(self) -> None:
+        """Save the last rendered frame to /tmp/adsb-display-screenshot.png."""
+        if self._last_frame is not None:
+            path = "/tmp/adsb-display-screenshot.png"
+            self._last_frame.save(path)
+            log.info("Screenshot saved to %s", path)
 
     # ── main loops ─────────────────────────────────────────────────────────
 
@@ -1198,6 +1328,11 @@ def _signal_handler(sig, frame):
         _app._running = False
 
 
+def _screenshot_handler(sig, frame):
+    if _app:
+        _app.save_screenshot()
+
+
 def main() -> None:
     global _app
     logging.basicConfig(
@@ -1207,6 +1342,7 @@ def main() -> None:
     )
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGUSR1, _screenshot_handler)
     _app = DisplayApp()
     _app.run()
 
