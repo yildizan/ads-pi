@@ -6,13 +6,16 @@ Drives a Waveshare 1.44inch LCD HAT (ST7735S, 128x128, SPI) on a Raspberry Pi.
 
 Screens:
   - Status  : WiFi, ADS-B / GPS / GDL90 data-flow, CPU temp, uptime
-  - Power   : Shutdown / Reboot overlay with 3-second countdown
+  - Config  : Power >, WiFi >, Theme toggle
+  - Power   : Shutdown / Reboot with 3-second countdown
+  - Network : WiFi network selection
 
 Inputs:
   KEY1 (GPIO21) = Back
   KEY2 (GPIO20) = Lock / Unlock
-  KEY3 (GPIO16) = Power Menu
-  Joystick Up/Down (GPIO 6/19) = navigate power menu
+  KEY3 (GPIO16) = Config Menu
+  Joystick Up/Down (GPIO 6/19) = navigate menus
+  Joystick Left/Right (GPIO 5/26) = theme toggle / back
   Joystick Press (GPIO13) = confirm selection
 
 Requires: spidev, RPi.GPIO, Pillow  (apt: python3-pil, pip: spidev)
@@ -27,6 +30,8 @@ import time
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont  # type: ignore[import-not-found]
+
+from configuration import Config
 
 log = logging.getLogger("adsb-display")
 
@@ -47,7 +52,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 PIN_KEY1       = 21   # Back
 PIN_KEY2       = 20   # Lock / Unlock
-PIN_KEY3       = 16   # Power menu
+PIN_KEY3       = 16   # Config menu
 PIN_JOY_UP     = 6
 PIN_JOY_DOWN   = 19
 PIN_JOY_LEFT   = 5
@@ -80,6 +85,11 @@ COUNTDOWN_SECS   = 3
 # ---------------------------------------------------------------------------
 # Colours (RGB tuples for PIL)
 # ---------------------------------------------------------------------------
+_THEMES = {
+    "dark":  {"bg": (0, 0, 0),       "text": (255, 255, 255)},
+    "light": {"bg": (255, 255, 255), "text": (0, 0, 0)},
+}
+
 COL_BG         = (0, 0, 0)
 COL_TEXT       = (255, 255, 255)
 COL_GREEN      = (0, 200, 0)
@@ -491,21 +501,33 @@ class _FlowMonitor:
 SCREEN_STATUS  = 0
 SCREEN_POWER   = 1
 SCREEN_NETWORK = 2
+SCREEN_CONFIG  = 3
 
 POWER_SHUTDOWN = 0
 POWER_REBOOT   = 1
+
+# Config menu item indices
+CFG_POWER = 0
+CFG_WIFI  = 1
+CFG_THEME = 2
+_CFG_COUNT = 3
+_THEME_OPTIONS = ["dark", "light"]
 
 
 class DisplayApp:
 
     def __init__(self) -> None:
         self.lcd = ST7735S()
+        self.cfg = Config()
 
         # State
         self.screen = SCREEN_STATUS
         self.locked = False
         self.power_selection = POWER_SHUTDOWN
         self._countdown_active = False
+
+        # Config menu state
+        self._cfg_selection = 0
 
         # Network menu state
         self._net_list: list[tuple[str, bool]] = []  # (name, available)
@@ -522,6 +544,9 @@ class DisplayApp:
         self._font_xs = None
         self._load_fonts()
 
+        # Apply theme from config
+        self._apply_theme()
+
         # Flow monitors
         self.mon_adsb  = _FlowMonitor("/tmp/adsb_heartbeat")
         self.mon_gps   = _FlowMonitor("/tmp/gps_heartbeat")
@@ -535,6 +560,13 @@ class DisplayApp:
 
         # Running flag
         self._running = True
+
+    def _apply_theme(self) -> None:
+        global COL_BG, COL_TEXT
+        theme = self.cfg.get("display", "theme")
+        palette = _THEMES.get(theme, _THEMES["dark"])
+        COL_BG = palette["bg"]
+        COL_TEXT = palette["text"]
 
     def _load_fonts(self) -> None:
         font_paths = [
@@ -596,16 +628,54 @@ class DisplayApp:
 
         if self.screen == SCREEN_STATUS:
             if self._debounced(PIN_KEY3):
-                self.screen = SCREEN_POWER
-                self.power_selection = POWER_SHUTDOWN
+                self.screen = SCREEN_CONFIG
+                self._cfg_selection = 0
                 self._redraw_event.set()
-            elif self._debounced(PIN_KEY1):
-                self._open_network_menu()
+
+        elif self.screen == SCREEN_CONFIG:
+            if self._debounced(PIN_KEY1):
+                self.screen = SCREEN_STATUS
+                self._redraw_event.set()
+
+            elif self._debounced(PIN_JOY_LEFT):
+                if self._cfg_selection == CFG_THEME:
+                    self._cycle_theme(-1)
+                else:
+                    self.screen = SCREEN_STATUS
+                    self._redraw_event.set()
+
+            elif self._debounced(PIN_JOY_UP):
+                if self._cfg_selection > 0:
+                    self._cfg_selection -= 1
+                    self._redraw_event.set()
+
+            elif self._debounced(PIN_JOY_DOWN):
+                if self._cfg_selection < _CFG_COUNT - 1:
+                    self._cfg_selection += 1
+                    self._redraw_event.set()
+
+            elif self._debounced(PIN_JOY_RIGHT):
+                if self._cfg_selection == CFG_THEME:
+                    self._cycle_theme(1)
+                elif self._cfg_selection == CFG_POWER:
+                    self.screen = SCREEN_POWER
+                    self.power_selection = POWER_SHUTDOWN
+                    self._redraw_event.set()
+                elif self._cfg_selection == CFG_WIFI:
+                    self._open_network_menu()
+
+            elif self._debounced(PIN_JOY_PRESS):
+                if self._cfg_selection == CFG_POWER:
+                    self.screen = SCREEN_POWER
+                    self.power_selection = POWER_SHUTDOWN
+                    self._redraw_event.set()
+                elif self._cfg_selection == CFG_WIFI:
+                    self._open_network_menu()
 
         elif self.screen == SCREEN_POWER:
-            if self._debounced(PIN_KEY3) or self._debounced(PIN_JOY_LEFT):
-                # Back → return to status
-                self.screen = SCREEN_STATUS
+            if self._debounced(PIN_KEY1) or self._debounced(PIN_JOY_LEFT):
+                # Back → return to config
+                self.screen = SCREEN_CONFIG
                 self._redraw_event.set()
 
             elif self._debounced(PIN_JOY_UP) or self._debounced(PIN_JOY_DOWN):
@@ -621,8 +691,8 @@ class DisplayApp:
 
         elif self.screen == SCREEN_NETWORK:
             if self._debounced(PIN_KEY1) or self._debounced(PIN_JOY_LEFT):
-                # Back → return to status
-                self.screen = SCREEN_STATUS
+                # Back → return to config
+                self.screen = SCREEN_CONFIG
                 self._redraw_event.set()
 
             elif self._debounced(PIN_JOY_UP):
@@ -650,6 +720,16 @@ class DisplayApp:
             if GPIO.input(pin) == 0:
                 return True
         return False
+
+    def _cycle_theme(self, direction: int) -> None:
+        """Cycle theme left (-1) or right (+1), save, and apply."""
+        current = self.cfg.get("display", "theme")
+        idx = _THEME_OPTIONS.index(current) if current in _THEME_OPTIONS else 0
+        idx = (idx + direction) % len(_THEME_OPTIONS)
+        self.cfg.set("display", "theme", _THEME_OPTIONS[idx])
+        self.cfg.save()
+        self._apply_theme()
+        self._redraw_event.set()
 
     def _open_network_menu(self) -> None:
         """Scan networks and open the network selection screen."""
@@ -815,6 +895,9 @@ class DisplayApp:
             elif key_fn == "wifi":
                 draw.text((cx - 5, cy - 6), "\U0001F310", fill=COL_TEXT,
                           font=self._icon_font)
+            elif key_fn == "config":
+                draw.text((cx - 5, cy - 6), "\u2699", fill=COL_TEXT,
+                          font=self._icon_font)
 
     # ── section header ─────────────────────────────────────────────────────
 
@@ -904,8 +987,45 @@ class DisplayApp:
             y += 14
             draw.text((3, y), f"\u26a0 {throttle}", fill=COL_YELLOW, font=self._font_sm)
 
-        # Soft keys: wifi | lock | power
-        self._draw_softkeys(draw, "wifi", "lock", "power")
+        # Soft keys: (none) | lock | config
+        self._draw_softkeys(draw, "", "lock", "config")
+
+    # ── config menu ────────────────────────────────────────────────────────
+
+    def _draw_config_menu(self, draw: ImageDraw.ImageDraw) -> None:
+        cw = self._CONTENT_W
+
+        # Title
+        draw.text((15, 20), "Config", fill=COL_YELLOW, font=self._font)
+        draw.line([(5, 36), (cw - 5, 36)], fill=COL_GREY)
+
+        items = [
+            ("Power", ">"),
+            ("WiFi", ">"),
+        ]
+        # Theme inline toggle — sun for light, moon for dark
+        theme_val = self.cfg.get("display", "theme")
+        theme_icon = "\u263E" if theme_val == "dark" else "\u2600"
+        items.append(("Theme", f"< {theme_icon} >"))
+
+        for i, (label, suffix) in enumerate(items):
+            y = 46 + i * 22
+            selected = i == self._cfg_selection
+            if selected:
+                draw.rectangle([(4, y - 2), (cw - 4, y + 16)],
+                               fill=COL_HIGHLIGHT)
+                draw.text((10, y), f"> {label}", fill=COL_TEXT, font=self._font)
+            else:
+                draw.text((10, y), f"  {label}", fill=COL_GREY, font=self._font)
+            # Right-aligned suffix (use icon font for theme row)
+            sfont = self._icon_font_sm if i == CFG_THEME else self._font_sm
+            sw = sfont.getlength(suffix) if hasattr(sfont, 'getlength') else len(suffix) * 6
+            draw.text((int(cw - sw - 6), y + 2), suffix,
+                      fill=COL_TEXT if selected else COL_GREY,
+                      font=sfont)
+
+        # Soft keys: back | lock | (none)
+        self._draw_softkeys(draw, "back", "lock", "")
 
     # ── power menu ─────────────────────────────────────────────────────────
 
@@ -913,7 +1033,7 @@ class DisplayApp:
         cw = self._CONTENT_W
 
         # Title
-        draw.text((15, 20), "Power Menu", fill=COL_YELLOW, font=self._font)
+        draw.text((15, 20), "Power", fill=COL_YELLOW, font=self._font)
         draw.line([(5, 36), (cw - 5, 36)], fill=COL_GREY)
 
         opts = ["Shutdown", "Reboot"]
@@ -929,8 +1049,8 @@ class DisplayApp:
         # Hint
         draw.text((4, 108), "Press to confirm", fill=COL_GREY, font=self._font_sm)
 
-        # Soft keys: (none) | lock | back
-        self._draw_softkeys(draw, "", "lock", "back")
+        # Soft keys: back | lock | (none)
+        self._draw_softkeys(draw, "back", "lock", "")
 
     # ── network menu ───────────────────────────────────────────────────────
 
@@ -1012,6 +1132,8 @@ class DisplayApp:
 
         if self.screen == SCREEN_STATUS:
             self._draw_status(draw)
+        elif self.screen == SCREEN_CONFIG:
+            self._draw_config_menu(draw)
         elif self.screen == SCREEN_POWER:
             self._draw_power_menu(draw)
         elif self.screen == SCREEN_NETWORK:
