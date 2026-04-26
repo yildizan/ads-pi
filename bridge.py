@@ -27,6 +27,7 @@ GDL90_BROADCAST_ADDR = "255.255.255.255"
 AIRCRAFT_TIMEOUT = 60  # seconds before an aircraft is expired
 NMEA_HOST = "0.0.0.0"
 NMEA_UDP_PORT = 3999                # UDP port for NMEA from GPS2IP Lite
+OWNSHIP_JSON_PATH = "/tmp/ownship.json"
 
 # Ownship fallback position — used until first NMEA fix arrives
 _OWNSHIP_DEFAULT_LAT = 0.0
@@ -563,6 +564,22 @@ def _nmea_listener() -> None:
                     try:
                         with open("/tmp/gps_heartbeat", "w") as f:
                             f.write(str(time.time()))
+                    except Exception:
+                        pass
+                    try:
+                        with _ownship_lock:
+                            snap = {
+                                "lat": _ownship["lat"],
+                                "lon": _ownship["lon"],
+                                "alt_ft": _ownship["alt_ft"],
+                                "track_deg": _ownship["track_deg"],
+                                "speed_kt": _ownship["speed_kt"],
+                                "has_fix": _ownship["has_fix"],
+                            }
+                        tmp = OWNSHIP_JSON_PATH + ".tmp"
+                        with open(tmp, "w") as f:
+                            json.dump(snap, f)
+                        os.replace(tmp, OWNSHIP_JSON_PATH)
                     except Exception:
                         pass
         except Exception as exc:
