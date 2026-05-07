@@ -669,13 +669,14 @@ _aircraft: dict[str, dict] = {}
 _aircraft_lock = threading.Lock()
 
 
-def _read_readsb_json() -> None:
-    """Read /run/readsb/aircraft.json and update the aircraft dictionary."""
+def _read_readsb_json() -> bool:
+    """Read /run/readsb/aircraft.json and update the aircraft dictionary.
+    Returns True if the file was read successfully."""
     try:
         with open(READSB_JSON_PATH, "r") as f:
             data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return
+        return False
 
     now = time.time()
     with _aircraft_lock:
@@ -708,6 +709,8 @@ def _read_readsb_json() -> None:
                 reg, _ = _lookup_aircraft(icao)
                 ac["reg"] = reg
 
+    return True
+
 
 def _expire_aircraft() -> None:
     """Remove aircraft not seen for AIRCRAFT_TIMEOUT seconds."""
@@ -726,12 +729,12 @@ def _readsb_reader() -> None:
     """Poll /run/readsb/aircraft.json and update the aircraft dictionary."""
     print(f"[READSB] Reading from {READSB_JSON_PATH}")
     while True:
-        _read_readsb_json()
-        try:
-            with open("/tmp/adsb_heartbeat", "w") as f:
-                f.write(str(time.time()))
-        except Exception:
-            pass
+        if _read_readsb_json():
+            try:
+                with open("/tmp/adsb_heartbeat", "w") as f:
+                    f.write(str(time.time()))
+            except Exception:
+                pass
         time.sleep(READSB_POLL_INTERVAL)
 
 
