@@ -1389,16 +1389,21 @@ class DisplayApp:
             outline=c["ring"],
         )
 
-        # Cross-hair lines
-        draw.line([(cx, cy - r), (cx, cy + r)], fill=c["ring"])
-        draw.line([(cx - r, cy), (cx + r, cy)], fill=c["ring"])
+        # Cross-hair lines (with gap around ownship icon)
+        gap_v = 7   # vertical gap half-size
+        gap_h = 8   # horizontal gap half-size
+        draw.line([(cx, cy - r), (cx, cy - gap_v)], fill=c["ring"])
+        draw.line([(cx, cy + gap_v), (cx, cy + r)], fill=c["ring"])
+        draw.line([(cx - r, cy), (cx - gap_h, cy)], fill=c["ring"])
+        draw.line([(cx + gap_h, cy), (cx + r, cy)], fill=c["ring"])
 
-        # Range labels
-        draw.text((cx + ring_r + 1, cy - 4), "5", fill=c["grey"], font=self._font_xs)
-        draw.text((cx + r + 1, cy - 4), "10", fill=c["grey"], font=self._font_xs)
-
-        # North indicator
-        draw.text((cx - 3, 1), "N", fill=c["grey"], font=self._font_xs)
+        # Range labels (45° upper-right of each circle)
+        r5_off = int(ring_r * 0.707)
+        r10_off = int(r * 0.707)
+        draw.text((cx + r5_off + 2, cy - r5_off - 10), "5",
+                  fill=c["grey"], font=self._font_xs)
+        draw.text((cx + r10_off + 2, cy - r10_off - 10), "10",
+                  fill=c["grey"], font=self._font_xs)
 
         radar = self._read_radar_json()
         if radar is None or not radar.get("has_fix"):
@@ -1407,11 +1412,10 @@ class DisplayApp:
 
         own_track = radar.get("ownship_track") or 0.0
 
-        # Ownship marker (small filled circle)
-        draw.ellipse(
-            [(cx - 2, cy - 2), (cx + 2, cy + 2)],
-            fill=c["own"],
-        )
+        # Ownship marker (top-down aircraft planform)
+        draw.line([(cx, cy - 4), (cx, cy + 5)], fill=c["own"])      # fuselage
+        draw.line([(cx - 6, cy - 1), (cx + 6, cy - 1)], fill=c["own"])  # wings
+        draw.line([(cx - 3, cy + 4), (cx + 3, cy + 4)], fill=c["own"])  # h-stab
 
         # Traffic diamonds
         for t in radar.get("traffic", []):

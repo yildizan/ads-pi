@@ -90,7 +90,7 @@ PALETTES: dict[str, dict[str, tuple[int, int, int]]] = {
         "grey":      (130, 130, 130),
         "highlight": (140, 160, 220),
         "surface":   (215, 215, 215),
-        "ring":      (200, 200, 200),
+        "ring":      (140, 140, 140),
         "own":       (0, 120, 200),
     },
 }
