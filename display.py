@@ -26,6 +26,7 @@ import logging
 import math
 import os
 import signal
+import sqlite3
 import subprocess
 import threading
 import time
@@ -105,7 +106,6 @@ COL_RADAR_RING = (50, 50, 50)
 COL_RADAR_OWN  = (0, 180, 255)
 COL_BAND_RED   = (255, 60, 60)
 COL_BAND_YELLOW = (255, 200, 0)
-COL_BAND_WHITE = (200, 200, 200)
 
 # ---------------------------------------------------------------------------
 # ST7735S commands
@@ -510,17 +510,22 @@ SCREEN_POWER   = 1
 SCREEN_NETWORK = 2
 SCREEN_CONFIG  = 3
 SCREEN_RADAR   = 4
+SCREEN_OWNSHIP = 5
 
 RADAR_JSON_PATH = "/tmp/radar.json"
+READSB_JSON_PATH = "/run/readsb/aircraft.json"
+OWNSHIP_JSON_PATH = "/tmp/ownship.json"
+AIRCRAFT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aircraft.db")
 
 POWER_SHUTDOWN = 0
 POWER_REBOOT   = 1
 
 # Config menu item indices
-CFG_THEME = 0
-CFG_WIFI  = 1
-CFG_POWER = 2
-_CFG_COUNT = 3
+CFG_THEME    = 0
+CFG_OWNSHIP  = 1
+CFG_WIFI     = 2
+CFG_POWER    = 3
+_CFG_COUNT   = 4
 _THEME_OPTIONS = ["dark", "light"]
 
 
@@ -544,6 +549,13 @@ class DisplayApp:
         self._net_selection = 0
         self._net_scroll = 0  # top visible index
         self._net_connecting = False
+
+        # Ownship aircraft list state
+        self._own_list: list[dict] = []  # [{icao, callsign, dist_nm}]
+        self._own_selection = 0
+        self._own_scroll = 0
+        self._own_has_lock = False
+        self._own_lock_label = ""
 
         # Debounce timestamps per pin
         self._last_press: dict[int, float] = {p: 0.0 for p in ALL_INPUT_PINS}
@@ -684,6 +696,8 @@ class DisplayApp:
                     self._redraw_event.set()
                 elif self._cfg_selection == CFG_WIFI:
                     self._open_network_menu()
+                elif self._cfg_selection == CFG_OWNSHIP:
+                    self._open_ownship_menu()
 
             elif self._debounced(PIN_JOY_PRESS):
                 if self._cfg_selection == CFG_POWER:
@@ -692,6 +706,8 @@ class DisplayApp:
                     self._redraw_event.set()
                 elif self._cfg_selection == CFG_WIFI:
                     self._open_network_menu()
+                elif self._cfg_selection == CFG_OWNSHIP:
+                    self._open_ownship_menu()
 
         elif self.screen == SCREEN_POWER:
             if self._debounced(PIN_KEY1) or self._debounced(PIN_JOY_LEFT):
@@ -734,6 +750,29 @@ class DisplayApp:
             elif self._debounced(PIN_JOY_PRESS):
                 if self._net_list:
                     self._connect_to_selected_network()
+
+        elif self.screen == SCREEN_OWNSHIP:
+            if self._debounced(PIN_KEY1) or self._debounced(PIN_JOY_LEFT):
+                self.screen = SCREEN_CONFIG
+                self._redraw_event.set()
+
+            elif self._debounced(PIN_JOY_UP):
+                if self._own_selection > 0:
+                    self._own_selection -= 1
+                    if self._own_selection < self._own_scroll:
+                        self._own_scroll = self._own_selection
+                    self._redraw_event.set()
+
+            elif self._debounced(PIN_JOY_DOWN):
+                total = len(self._own_list) + (1 if self._own_has_lock else 0)
+                if self._own_selection < total - 1:
+                    self._own_selection += 1
+                    if self._own_selection >= self._own_scroll + 5:
+                        self._own_scroll = self._own_selection - 4
+                    self._redraw_event.set()
+
+            elif self._debounced(PIN_JOY_PRESS):
+                self._select_ownship_aircraft()
 
     def _any_key_pressed(self) -> bool:
         """Return True if any button or joystick direction is pressed."""
@@ -797,6 +836,116 @@ class DisplayApp:
             self.lcd.show_image(img)
             time.sleep(1.5)
         self._redraw_event.set()
+
+    def _open_ownship_menu(self) -> None:
+        """Build aircraft list sorted by distance and open the ownship screen."""
+        # Read ownship position for distance calculation
+        own_lat, own_lon = None, None
+        try:
+            with open(OWNSHIP_JSON_PATH, "r") as f:
+                own = json.load(f)
+            if own.get("has_fix"):
+                own_lat = own["lat"]
+                own_lon = own["lon"]
+        except Exception:
+            pass
+
+        # Read aircraft from readsb
+        aircraft = []
+        try:
+            with open(READSB_JSON_PATH, "r") as f:
+                data = json.load(f)
+            for ac in data.get("aircraft", []):
+                icao = ac.get("hex", "").strip().upper()
+                if not icao:
+                    continue
+                lat = ac.get("lat")
+                lon = ac.get("lon")
+                if lat is None or lon is None:
+                    continue
+                # Prefer registration from DB, then flight callsign, then ICAO
+                reg = self._lookup_registration(icao)
+                callsign = (reg or ac.get("flight") or icao).strip()
+                dist = None
+                if own_lat is not None and own_lon is not None:
+                    dist = self._haversine_nm(own_lat, own_lon, lat, lon)
+                aircraft.append({
+                    "icao": icao,
+                    "callsign": callsign,
+                    "dist_nm": dist,
+                })
+        except Exception:
+            pass
+
+        # Sort by distance (None = unknown → end of list)
+        aircraft.sort(key=lambda a: a["dist_nm"] if a["dist_nm"] is not None else 9999)
+
+        # If ownship override is active, prepend a "Reset" entry
+        current_icao = self.cfg.get("ownship", "icao").strip()
+        current_cs = self.cfg.get("ownship", "callsign").strip()
+        self._own_has_lock = bool(current_icao)
+        self._own_lock_label = current_cs or current_icao
+
+        self._own_list = aircraft
+        self._own_selection = 0
+        self._own_scroll = 0
+        self.screen = SCREEN_OWNSHIP
+        self._redraw_event.set()
+
+    def _select_ownship_aircraft(self) -> None:
+        """Handle press on the ownship aircraft list."""
+        if self._own_has_lock and self._own_selection == 0:
+            # Reset — clear the lock
+            self.cfg.set("ownship", "icao", "")
+            self.cfg.set("ownship", "callsign", "")
+            self.cfg.save()
+            self.screen = SCREEN_CONFIG
+            self._redraw_event.set()
+            return
+
+        # Offset: if lock is active, first row is Reset
+        idx = self._own_selection - (1 if self._own_has_lock else 0)
+        if 0 <= idx < len(self._own_list):
+            ac = self._own_list[idx]
+            self.cfg.set("ownship", "icao", ac["icao"])
+            self.cfg.set("ownship", "callsign", ac["callsign"])
+            self.cfg.save()
+
+            # Brief confirmation
+            img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), COL_BG)
+            draw = ImageDraw.Draw(img)
+            draw.text((10, 45), "Ownship set:", fill=COL_GREEN, font=self._font)
+            draw.text((10, 63), ac["callsign"][:12], fill=COL_TEXT, font=self._font_sm)
+            self.lcd.show_image(img)
+            time.sleep(1.0)
+
+            self.screen = SCREEN_STATUS
+            self._redraw_event.set()
+
+    @staticmethod
+    def _haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Great-circle distance in nautical miles."""
+        lat1, lon1, lat2, lon2 = (math.radians(v) for v in (lat1, lon1, lat2, lon2))
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+        return 2 * math.asin(math.sqrt(a)) * 3440.065
+
+    @staticmethod
+    def _lookup_registration(icao: str) -> str:
+        """Look up aircraft registration by ICAO hex from the SQLite DB."""
+        if not os.path.exists(AIRCRAFT_DB_PATH):
+            return ""
+        try:
+            db = sqlite3.connect(AIRCRAFT_DB_PATH)
+            db.execute("PRAGMA query_only = ON")
+            row = db.execute(
+                "SELECT reg FROM aircraft WHERE icao = ?", (icao.upper(),)
+            ).fetchone()
+            db.close()
+            return row[0] if row and row[0] else ""
+        except Exception:
+            return ""
 
     def _execute_power_action(self) -> None:
         """Show countdown then shutdown or reboot."""
@@ -952,7 +1101,7 @@ class DisplayApp:
             avail_w = cw - text_x - 2
             display_ssid = ssid
             while len(display_ssid) > 1:
-                tw = self._font_sm.getlength(display_ssid) if hasattr(self._font_sm, 'getlength') else len(display_ssid) * 6
+                tw = self._font_sm.getlength(display_ssid) if hasattr(self._font_sm, 'getlength') else len(display_ssid) * 6 # type: ignore
                 if tw <= avail_w:
                     break
                 display_ssid = display_ssid[:-1]
@@ -973,13 +1122,24 @@ class DisplayApp:
         # Row 1: ADS-B (left) + GPS (right)
         self._draw_status_dot(draw, 3, y, self.mon_adsb.active, self._icon_font_sm)
         draw.text((14, y), "ADS-B", fill=COL_TEXT, font=self._font_sm)
-        self._draw_status_dot(draw, 56, y, self.mon_gps.active, self._icon_font_sm)
-        draw.text((67, y), "GPS", fill=COL_TEXT, font=self._font_sm)
+
+        # GPS: show pause icon if ownship override is active
+        own_icao = self.cfg.get("ownship", "icao").strip()
+        if own_icao:
+            draw.text((56, y), "\u23F8", fill=COL_YELLOW, font=self._icon_font_sm)
+            draw.text((67, y), "GPS", fill=COL_TEXT, font=self._font_sm)
+        else:
+            self._draw_status_dot(draw, 56, y, self.mon_gps.active, self._icon_font_sm)
+            draw.text((67, y), "GPS", fill=COL_TEXT, font=self._font_sm)
         y += 14
 
-        # Row 2: GDL90
+        # Row 2: GDL90 (left) + Ownship aircraft (right, only when override active)
         self._draw_status_dot(draw, 3, y, self.mon_gdl90.active, self._icon_font_sm)
         draw.text((14, y), "GDL90", fill=COL_TEXT, font=self._font_sm)
+        if own_icao:
+            own_cs = self.cfg.get("ownship", "callsign").strip() or own_icao
+            draw.text((56, y), "\u2708", fill=COL_GREEN, font=self._icon_font_sm)
+            draw.text((67, y), own_cs[:6], fill=COL_TEXT, font=self._font_sm)
         y += 14
 
         # ── SYSTEM ──
@@ -1026,12 +1186,13 @@ class DisplayApp:
 
         items = [
             ("Theme", f"< {theme_icon} >"),
+            ("Ownship", ">"),
             ("WiFi", ">"),
             ("Power", ">"),
         ]
 
         for i, (label, suffix) in enumerate(items):
-            y = 46 + i * 22
+            y = 42 + i * 20
             selected = i == self._cfg_selection
             if selected:
                 draw.rectangle([(4, y - 2), (cw - 4, y + 16)],
@@ -1041,7 +1202,7 @@ class DisplayApp:
                 draw.text((10, y), f"  {label}", fill=COL_GREY, font=self._font)
             # Right-aligned suffix (use icon font for theme row)
             sfont = self._icon_font_sm if i == CFG_THEME else self._font_sm
-            sw = sfont.getlength(suffix) if hasattr(sfont, 'getlength') else len(suffix) * 6
+            sw = sfont.getlength(suffix) if hasattr(sfont, 'getlength') else len(suffix) * 6 # type: ignore
             draw.text((int(cw - sw - 6), y + 2), suffix,
                       fill=COL_TEXT if selected else COL_GREY,
                       font=sfont)
@@ -1116,7 +1277,7 @@ class DisplayApp:
             display_name = name
             max_w = cw - 22
             while len(display_name) > 1:
-                tw = self._font_sm.getlength(display_name) if hasattr(
+                tw = self._font_sm.getlength(display_name) if hasattr( # type: ignore
                     self._font_sm, 'getlength') else len(display_name) * 6
                 if tw <= max_w:
                     break
@@ -1145,6 +1306,72 @@ class DisplayApp:
         # Soft keys: back | lock | (none)
         self._draw_softkeys(draw, "back", "lock", "")
 
+    # ── ownship aircraft screen ──────────────────────────────────────────
+
+    def _draw_ownship_menu(self, draw: ImageDraw.ImageDraw) -> None:
+        cw = self._CONTENT_W
+
+        # Title
+        draw.text((10, 2), "Ownship", fill=COL_YELLOW, font=self._font)
+        draw.line([(5, 17), (cw - 5, 17)], fill=COL_GREY)
+
+        # Build display list: optionally "Reset" row + aircraft
+        rows: list[tuple[str, str, tuple]] = []  # (left_text, right_text, colour)
+        if self._own_has_lock:
+            rows.append(
+                (f"\u2718 {self._own_lock_label[:10]}", "Reset", COL_RED)
+            )
+
+        for ac in self._own_list:
+            cs = ac["callsign"][:8]
+            if ac["dist_nm"] is not None:
+                dist_str = f"{ac['dist_nm']:.1f}nm"
+            else:
+                dist_str = ""
+            rows.append((cs, dist_str, COL_TEXT))
+
+        if not rows:
+            draw.text((10, 50), "No aircraft", fill=COL_GREY, font=self._font)
+            self._draw_softkeys(draw, "back", "lock", "")
+            return
+
+        max_visible = 5
+        row_h = 18
+        y_start = 21
+        end = min(self._own_scroll + max_visible, len(rows))
+
+        if self._own_scroll > 0:
+            draw.text((cw - 15, y_start - 2), "\u25B2", fill=COL_GREY,
+                      font=self._font_xs)
+
+        for idx in range(self._own_scroll, end):
+            left, right, col = rows[idx]
+            y = y_start + (idx - self._own_scroll) * row_h
+            selected = idx == self._own_selection
+
+            if selected:
+                draw.rectangle([(2, y - 1), (cw - 2, y + row_h - 3)],
+                               fill=COL_HIGHLIGHT)
+
+            prefix = ">" if selected else " "
+            draw.text((4, y), prefix, fill=COL_TEXT, font=self._font_sm)
+            draw.text((12, y), left, fill=col, font=self._font_sm)
+            # Right-align distance
+            if right:
+                rw = self._font_xs.getlength(right) if hasattr(self._font_xs, 'getlength') else len(right) * 6 # type: ignore
+                draw.text((int(cw - rw - 4), y + 1), right,
+                          fill=COL_GREY if col != COL_RED else COL_RED,
+                          font=self._font_xs)
+
+        if end < len(rows):
+            draw.text((cw - 15, y_start + max_visible * row_h - 4),
+                      "\u25BC", fill=COL_GREY, font=self._font_xs)
+
+        draw.text((4, 114), "Press to select",
+                  fill=COL_GREY, font=self._font_xs)
+
+        self._draw_softkeys(draw, "back", "lock", "")
+
     # ── radar screen ─────────────────────────────────────────────────────────────────
 
     _DIAMOND_SIZE = 3                    # half-size of traffic diamond
@@ -1152,7 +1379,7 @@ class DisplayApp:
     _BAND_COLOURS: dict[str, tuple] = {
         "red": COL_BAND_RED,
         "yellow": COL_BAND_YELLOW,
-        "white": COL_BAND_WHITE,
+        "white": COL_TEXT,
     }
 
     def _read_radar_json(self) -> dict | None:
@@ -1222,7 +1449,7 @@ class DisplayApp:
             tx = max(ds, min(LCD_WIDTH - 1 - ds, tx))
             ty = max(ds, min(LCD_HEIGHT - 1 - ds, ty))
 
-            col = self._BAND_COLOURS.get(band, COL_BAND_WHITE)
+            col = self._BAND_COLOURS.get(band, COL_TEXT)
             ix, iy = int(tx), int(ty)
 
             # Diamond shape (4 points)
@@ -1258,6 +1485,8 @@ class DisplayApp:
             self._draw_power_menu(draw)
         elif self.screen == SCREEN_NETWORK:
             self._draw_network_menu(draw)
+        elif self.screen == SCREEN_OWNSHIP:
+            self._draw_ownship_menu(draw)
         elif self.screen == SCREEN_RADAR:
             self._draw_radar(draw)
 
@@ -1342,7 +1571,7 @@ def main() -> None:
     )
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGUSR1, _screenshot_handler)
+    signal.signal(signal.SIGUSR1, _screenshot_handler) # type: ignore
     _app = DisplayApp()
     _app.run()
 

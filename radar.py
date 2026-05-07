@@ -15,6 +15,8 @@ import math
 import os
 import time
 
+from configuration import Config
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -25,6 +27,9 @@ RADAR_JSON_PATH = "/tmp/radar.json"
 UPDATE_INTERVAL = 3.0       # seconds (0.33 Hz)
 MAX_RANGE_NM = 10.0         # only show traffic within this range
 ALT_FILTER_FT = 5000        # ±ft relative to ownship
+
+# Shared configuration (for ownship aircraft override)
+_cfg = Config()
 
 # ---------------------------------------------------------------------------
 # Haversine helpers
@@ -94,11 +99,19 @@ def _process() -> None:
         _write_radar(own_track, [], has_fix=True)
         return
 
+    # Exclude ownship override aircraft from radar
+    override_icao = _cfg.get("ownship", "icao", reload=True).strip().upper()
+
     traffic = []
     for ac in readsb.get("aircraft", []):
         lat = ac.get("lat")
         lon = ac.get("lon")
         if lat is None or lon is None:
+            continue
+
+        # Skip the ownship override aircraft
+        icao = ac.get("hex", "").strip().upper()
+        if override_icao and icao == override_icao:
             continue
 
         # Altitude filter

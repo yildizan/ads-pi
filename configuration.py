@@ -17,6 +17,10 @@ _DEFAULTS = {
     "display": {
         "theme": "dark",
     },
+    "ownship": {
+        "icao": "",
+        "callsign": "",
+    },
 }
 
 
@@ -40,7 +44,9 @@ class Config:
         else:
             log.info("Config file %s not found, using defaults", self._path)
 
-    def get(self, section: str, key: str) -> str:
+    def get(self, section: str, key: str, *, reload: bool = False) -> str:
+        if reload:
+            self._load()
         return self._cp.get(section, key, fallback=_DEFAULTS.get(section, {}).get(key, ""))
 
     def set(self, section: str, key: str, value: str) -> None:
