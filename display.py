@@ -34,7 +34,7 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont  # type: ignore[import-not-found]
 
-from configuration import Config
+from configuration import Config, get_palette
 
 log = logging.getLogger("adsb-display")
 
@@ -84,28 +84,6 @@ REFRESH_INTERVAL = 3.0   # seconds between idle redraws
 DEBOUNCE_MS      = 500   # milliseconds for buttons
 DEBOUNCE_JOY_MS  = 400   # milliseconds for joystick (longer to avoid double-step)
 COUNTDOWN_SECS   = 3
-
-# ---------------------------------------------------------------------------
-# Colours (RGB tuples for PIL)
-# ---------------------------------------------------------------------------
-_THEMES = {
-    "dark":  {"bg": (0, 0, 0),       "text": (255, 255, 255)},
-    "light": {"bg": (255, 255, 255), "text": (0, 0, 0)},
-}
-
-COL_BG         = (0, 0, 0)
-COL_TEXT       = (255, 255, 255)
-COL_GREEN      = (0, 200, 0)
-COL_RED        = (255, 60, 60)
-COL_YELLOW     = (255, 200, 0)
-COL_GREY       = (120, 120, 120)
-COL_HIGHLIGHT  = (50, 50, 180)
-COL_SECTION    = (80, 80, 80)
-COL_SOFTKEY_BG = (40, 40, 40)
-COL_RADAR_RING = (50, 50, 50)
-COL_RADAR_OWN  = (0, 180, 255)
-COL_BAND_RED   = (255, 60, 60)
-COL_BAND_YELLOW = (255, 200, 0)
 
 # ---------------------------------------------------------------------------
 # ST7735S commands
@@ -567,7 +545,7 @@ class DisplayApp:
         self._load_fonts()
 
         # Apply theme from config
-        self._apply_theme()
+        self.colors = get_palette(self.cfg.get("display", "theme"))
 
         # Flow monitors
         self.mon_adsb  = _FlowMonitor("/tmp/adsb_heartbeat")
@@ -585,13 +563,6 @@ class DisplayApp:
 
         # Running flag
         self._running = True
-
-    def _apply_theme(self) -> None:
-        global COL_BG, COL_TEXT
-        theme = self.cfg.get("display", "theme")
-        palette = _THEMES.get(theme, _THEMES["dark"])
-        COL_BG = palette["bg"]
-        COL_TEXT = palette["text"]
 
     def _load_fonts(self) -> None:
         font_paths = [
@@ -788,7 +759,7 @@ class DisplayApp:
         idx = (idx + direction) % len(_THEME_OPTIONS)
         self.cfg.set("display", "theme", _THEME_OPTIONS[idx])
         self.cfg.save()
-        self._apply_theme()
+        self.colors = get_palette(self.cfg.get("display", "theme"))
         self._redraw_event.set()
 
     def _open_network_menu(self) -> None:
@@ -818,21 +789,22 @@ class DisplayApp:
 
         ok = _connect_network(name)
 
+        c = self.colors
         self._net_connecting = False
         if ok:
             # Show brief success then return to status
-            img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), COL_BG)
+            img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), c["bg"])
             draw = ImageDraw.Draw(img)
-            draw.text((10, 50), "Connected!", fill=COL_GREEN, font=self._font)
-            draw.text((10, 68), name[:16], fill=COL_TEXT, font=self._font_sm)
+            draw.text((10, 50), "Connected!", fill=c["green"], font=self._font)
+            draw.text((10, 68), name[:16], fill=c["text"], font=self._font_sm)
             self.lcd.show_image(img)
             time.sleep(1.0)
             self.screen = SCREEN_STATUS
         else:
-            img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), COL_BG)
+            img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), c["bg"])
             draw = ImageDraw.Draw(img)
-            draw.text((10, 50), "Failed!", fill=COL_RED, font=self._font)
-            draw.text((10, 68), name[:16], fill=COL_TEXT, font=self._font_sm)
+            draw.text((10, 50), "Failed!", fill=c["red"], font=self._font)
+            draw.text((10, 68), name[:16], fill=c["text"], font=self._font_sm)
             self.lcd.show_image(img)
             time.sleep(1.5)
         self._redraw_event.set()
@@ -912,10 +884,11 @@ class DisplayApp:
             self.cfg.save()
 
             # Brief confirmation
-            img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), COL_BG)
+            c = self.colors
+            img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), c["bg"])
             draw = ImageDraw.Draw(img)
-            draw.text((10, 45), "Ownship set:", fill=COL_GREEN, font=self._font)
-            draw.text((10, 63), ac["callsign"][:12], fill=COL_TEXT, font=self._font_sm)
+            draw.text((10, 45), "Ownship set:", fill=c["green"], font=self._font)
+            draw.text((10, 63), ac["callsign"][:12], fill=c["text"], font=self._font_sm)
             self.lcd.show_image(img)
             time.sleep(1.0)
 
@@ -954,6 +927,7 @@ class DisplayApp:
 
         # Block render loop from overwriting countdown frames
         self._countdown_active = True
+        c = self.colors
 
         # Wait for joystick release before starting countdown
         while GPIO.input(PIN_JOY_PRESS) == 0:
@@ -961,14 +935,14 @@ class DisplayApp:
         time.sleep(0.3)
 
         for remaining in range(COUNTDOWN_SECS, 0, -1):
-            img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), COL_BG)
+            img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), c["bg"])
             draw = ImageDraw.Draw(img)
             draw.text((10, 40), f"{action}",
-                      fill=COL_YELLOW, font=self._font)
+                      fill=c["yellow"], font=self._font)
             draw.text((10, 57), f"in {remaining}...",
-                      fill=COL_TEXT, font=self._font)
+                      fill=c["text"], font=self._font)
             draw.text((5, 100), "Press any key to cancel",
-                      fill=COL_GREY, font=self._font_xs)
+                      fill=c["grey"], font=self._font_xs)
             self.lcd.show_image(img)
 
             # Allow cancel during countdown — any key aborts
@@ -986,10 +960,10 @@ class DisplayApp:
                 time.sleep(0.05)
 
         # Show final message
-        img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), COL_BG)
+        img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), c["bg"])
         draw = ImageDraw.Draw(img)
         msg = "Shutting down..." if cmd == "poweroff" else "Rebooting..."
-        draw.text((10, 55), msg, fill=COL_RED, font=self._font)
+        draw.text((10, 55), msg, fill=c["red"], font=self._font)
         self.lcd.show_image(img)
         time.sleep(0.5)
 
@@ -1003,48 +977,47 @@ class DisplayApp:
 
     # ── icon drawing helpers ───────────────────────────────────────────────
 
-    @staticmethod
-    def _draw_wifi_icon(draw: ImageDraw.ImageDraw, x: int, y: int,
+    def _draw_wifi_icon(self, draw: ImageDraw.ImageDraw, x: int, y: int,
                         connected: bool, font: Any) -> None:
         """Draw WiFi status using Unicode glyph."""
-        col = COL_GREEN if connected else COL_RED
+        c = self.colors
+        col = c["green"] if connected else c["red"]
         draw.text((x, y), "\u25C9" if connected else "\u25CE", fill=col, font=font)
 
-    @staticmethod
-    def _draw_status_dot(draw: ImageDraw.ImageDraw, x: int, y: int,
+    def _draw_status_dot(self, draw: ImageDraw.ImageDraw, x: int, y: int,
                          active: bool, font: Any) -> None:
         """Draw status indicator using Unicode glyph."""
+        c = self.colors
         if active:
-            draw.text((x, y), "\u2714", fill=COL_GREEN, font=font)
+            draw.text((x, y), "\u2714", fill=c["green"], font=font)
         else:
-            draw.text((x, y), "\u2718", fill=COL_RED, font=font)
+            draw.text((x, y), "\u2718", fill=c["red"], font=font)
 
-    @staticmethod
-    def _draw_temp_icon(draw: ImageDraw.ImageDraw, x: int, y: int,
+    def _draw_temp_icon(self, draw: ImageDraw.ImageDraw, x: int, y: int,
                         font: Any) -> None:
         """Draw temperature icon using Unicode glyph."""
-        draw.text((x, y), "\U0001F321", fill=COL_RED, font=font)
+        draw.text((x, y), "\U0001F321", fill=self.colors["red"], font=font)
 
-    @staticmethod
-    def _draw_clock_icon(draw: ImageDraw.ImageDraw, x: int, y: int,
+    def _draw_clock_icon(self, draw: ImageDraw.ImageDraw, x: int, y: int,
                          font: Any) -> None:
         """Draw uptime icon using Unicode glyph."""
-        draw.text((x, y), "\u23F1", fill=COL_TEXT, font=font)
+        draw.text((x, y), "\u23F1", fill=self.colors["text"], font=font)
 
     # ── soft key strip (right edge, vertical) ──────────────────────────────
 
     def _draw_softkeys(self, draw: ImageDraw.ImageDraw,
                        k1: str, k2: str, k3: str) -> None:
         """Draw the soft key strip on the right edge."""
+        c = self.colors
         x0 = self._CONTENT_W
         strip_h = LCD_HEIGHT // 3
 
         # Background strip
         draw.rectangle([(x0, 0), (LCD_WIDTH - 1, LCD_HEIGHT - 1)],
-                       fill=COL_SOFTKEY_BG)
+                       fill=c["surface"])
         # Dividers
-        draw.line([(x0, strip_h), (LCD_WIDTH, strip_h)], fill=COL_GREY)
-        draw.line([(x0, strip_h * 2), (LCD_WIDTH, strip_h * 2)], fill=COL_GREY)
+        draw.line([(x0, strip_h), (LCD_WIDTH, strip_h)], fill=c["grey"])
+        draw.line([(x0, strip_h * 2), (LCD_WIDTH, strip_h * 2)], fill=c["grey"])
 
         for i, key_fn in enumerate([k1, k2, k3]):
             if not key_fn:
@@ -1052,41 +1025,42 @@ class DisplayApp:
             cx = x0 + self._SK_W // 2
             cy = i * strip_h + strip_h // 2
             if key_fn == "back":
-                draw.text((cx - 5, cy - 6), "\u2190", fill=(255, 255, 255),
+                draw.text((cx - 5, cy - 6), "\u2190", fill=c["text"],
                           font=self._icon_font)
             elif key_fn == "lock":
-                col = COL_RED if self.locked else COL_GREEN
+                col = c["red"] if self.locked else c["green"]
                 draw.text((cx - 5, cy - 6),
                           "\U0001F512" if self.locked else "\U0001F513",
                           fill=col, font=self._icon_font)
             elif key_fn == "power":
-                draw.text((cx - 5, cy - 6), "\u23FB", fill=(255, 255, 255),
+                draw.text((cx - 5, cy - 6), "\u23FB", fill=c["text"],
                           font=self._icon_font)
             elif key_fn == "wifi":
-                draw.text((cx - 5, cy - 6), "\U0001F310", fill=(255, 255, 255),
+                draw.text((cx - 5, cy - 6), "\U0001F310", fill=c["text"],
                           font=self._icon_font)
             elif key_fn == "config":
-                draw.text((cx - 5, cy - 6), "\u2699", fill=(255, 255, 255),
+                draw.text((cx - 5, cy - 6), "\u2699", fill=c["text"],
                           font=self._icon_font)
 
     # ── section header ─────────────────────────────────────────────────────
 
-    @staticmethod
-    def _draw_section(draw: ImageDraw.ImageDraw, y: int, label: str,
+    def _draw_section(self, draw: ImageDraw.ImageDraw, y: int, label: str,
                       font: Any, max_w: int) -> int:
         """Draw a centered section header with side lines. Returns new y."""
+        c = self.colors
         tw = font.getlength(label) if hasattr(font, 'getlength') else len(label) * 6
         tx = int((max_w - tw) / 2)
         line_y = y + 6
-        draw.line([(2, line_y), (tx - 4, line_y)], fill=COL_SECTION)
-        draw.text((tx, y), label, fill=COL_SECTION, font=font)
+        draw.line([(2, line_y), (tx - 4, line_y)], fill=c["grey"])
+        draw.text((tx, y), label, fill=c["grey"], font=font)
         draw.line([(tx + int(tw) + 4, line_y), (max_w - 2, line_y)],
-                  fill=COL_SECTION)
+                  fill=c["grey"])
         return y + 14
 
     # ── status screen ──────────────────────────────────────────────────────
 
     def _draw_status(self, draw: ImageDraw.ImageDraw) -> None:
+        c = self.colors
         cw = self._CONTENT_W
         y = 1
 
@@ -1105,15 +1079,15 @@ class DisplayApp:
                 if tw <= avail_w:
                     break
                 display_ssid = display_ssid[:-1]
-            draw.text((text_x, y + 1), display_ssid, fill=COL_GREEN, font=self._font_sm)
+            draw.text((text_x, y + 1), display_ssid, fill=c["green"], font=self._font_sm)
         else:
-            draw.text((text_x, y + 1), "No WiFi", fill=COL_RED, font=self._font_sm)
+            draw.text((text_x, y + 1), "No WiFi", fill=c["red"], font=self._font_sm)
         y += 14
 
         if ip:
-            draw.text((3, y), f"IP:{ip}", fill=COL_TEXT, font=self._font_xs)
+            draw.text((3, y), f"IP:{ip}", fill=c["text"], font=self._font_xs)
         else:
-            draw.text((3, y), "IP: --", fill=COL_GREY, font=self._font_xs)
+            draw.text((3, y), "IP: --", fill=c["grey"], font=self._font_xs)
         y += 14
 
         # ── RX / TX ──
@@ -1121,25 +1095,25 @@ class DisplayApp:
 
         # Row 1: ADS-B (left) + GPS (right)
         self._draw_status_dot(draw, 3, y, self.mon_adsb.active, self._icon_font_sm)
-        draw.text((14, y), "ADS-B", fill=COL_TEXT, font=self._font_sm)
+        draw.text((14, y), "ADS-B", fill=c["text"], font=self._font_sm)
 
         # GPS: show pause icon if ownship override is active
         own_icao = self.cfg.get("ownship", "icao").strip()
         if own_icao:
-            draw.text((56, y), "\u23F8", fill=COL_YELLOW, font=self._icon_font_sm)
-            draw.text((67, y), "GPS", fill=COL_TEXT, font=self._font_sm)
+            draw.text((56, y), "\u23F8", fill=c["yellow"], font=self._icon_font_sm)
+            draw.text((67, y), "GPS", fill=c["text"], font=self._font_sm)
         else:
             self._draw_status_dot(draw, 56, y, self.mon_gps.active, self._icon_font_sm)
-            draw.text((67, y), "GPS", fill=COL_TEXT, font=self._font_sm)
+            draw.text((67, y), "GPS", fill=c["text"], font=self._font_sm)
         y += 14
 
         # Row 2: GDL90 (left) + Ownship aircraft (right, only when override active)
         self._draw_status_dot(draw, 3, y, self.mon_gdl90.active, self._icon_font_sm)
-        draw.text((14, y), "GDL90", fill=COL_TEXT, font=self._font_sm)
+        draw.text((14, y), "GDL90", fill=c["text"], font=self._font_sm)
         if own_icao:
             own_cs = self.cfg.get("ownship", "callsign").strip() or own_icao
-            draw.text((56, y), "\u2708", fill=COL_GREEN, font=self._icon_font_sm)
-            draw.text((67, y), own_cs[:6], fill=COL_TEXT, font=self._font_sm)
+            draw.text((56, y), "\u2708", fill=c["green"], font=self._icon_font_sm)
+            draw.text((67, y), own_cs[:6], fill=c["text"], font=self._font_sm)
         y += 14
 
         # ── SYSTEM ──
@@ -1149,24 +1123,24 @@ class DisplayApp:
         cpu_str, self._cpu_prev = _get_cpu_percent(self._cpu_prev)
         # Row 1: temp + CPU%
         self._draw_temp_icon(draw, 3, y, self._icon_font_sm)
-        draw.text((14, y + 1), temp, fill=COL_TEXT, font=self._font_sm)
-        draw.text((52, y), "CPU", fill=COL_GREY, font=self._font_sm)
-        draw.text((74, y), cpu_str, fill=COL_TEXT, font=self._font_sm)
+        draw.text((14, y + 1), temp, fill=c["text"], font=self._font_sm)
+        draw.text((52, y), "CPU", fill=c["grey"], font=self._font_sm)
+        draw.text((74, y), cpu_str, fill=c["text"], font=self._font_sm)
         y += 14
 
         up = _get_uptime()
         ram_str = _get_ram_percent()
         # Row 2: uptime + RAM%
         self._draw_clock_icon(draw, 3, y, self._icon_font_sm)
-        draw.text((14, y + 1), up, fill=COL_TEXT, font=self._font_sm)
-        draw.text((52, y), "RAM", fill=COL_GREY, font=self._font_sm)
-        draw.text((74, y), ram_str, fill=COL_TEXT, font=self._font_sm)
+        draw.text((14, y + 1), up, fill=c["text"], font=self._font_sm)
+        draw.text((52, y), "RAM", fill=c["grey"], font=self._font_sm)
+        draw.text((74, y), ram_str, fill=c["text"], font=self._font_sm)
 
         # Throttle warning (conditional, only when active)
         throttle = _get_throttle_status()
         if throttle:
             y += 14
-            draw.text((3, y), f"\u26a0 {throttle}", fill=COL_YELLOW, font=self._font_sm)
+            draw.text((3, y), f"\u26a0 {throttle}", fill=c["yellow"], font=self._font_sm)
 
         # Soft keys: (none) | lock | config
         self._draw_softkeys(draw, "", "lock", "config")
@@ -1174,11 +1148,12 @@ class DisplayApp:
     # ── config menu ────────────────────────────────────────────────────────
 
     def _draw_config_menu(self, draw: ImageDraw.ImageDraw) -> None:
+        c = self.colors
         cw = self._CONTENT_W
 
         # Title
-        draw.text((15, 20), "Config", fill=COL_YELLOW, font=self._font)
-        draw.line([(5, 36), (cw - 5, 36)], fill=COL_GREY)
+        draw.text((15, 20), "Config", fill=c["yellow"], font=self._font)
+        draw.line([(5, 36), (cw - 5, 36)], fill=c["grey"])
 
         # Theme inline toggle — sun for light, moon for dark
         theme_val = self.cfg.get("display", "theme")
@@ -1196,15 +1171,15 @@ class DisplayApp:
             selected = i == self._cfg_selection
             if selected:
                 draw.rectangle([(4, y - 2), (cw - 4, y + 16)],
-                               fill=COL_HIGHLIGHT)
-                draw.text((10, y), f"> {label}", fill=COL_TEXT, font=self._font)
+                               fill=c["highlight"])
+                draw.text((10, y), f"> {label}", fill=c["text"], font=self._font)
             else:
-                draw.text((10, y), f"  {label}", fill=COL_GREY, font=self._font)
+                draw.text((10, y), f"  {label}", fill=c["grey"], font=self._font)
             # Right-aligned suffix (use icon font for theme row)
             sfont = self._icon_font_sm if i == CFG_THEME else self._font_sm
             sw = sfont.getlength(suffix) if hasattr(sfont, 'getlength') else len(suffix) * 6 # type: ignore
             draw.text((int(cw - sw - 6), y + 2), suffix,
-                      fill=COL_TEXT if selected else COL_GREY,
+                      fill=c["text"] if selected else c["grey"],
                       font=sfont)
 
         # Soft keys: back | lock | (none)
@@ -1213,24 +1188,25 @@ class DisplayApp:
     # ── power menu ─────────────────────────────────────────────────────────
 
     def _draw_power_menu(self, draw: ImageDraw.ImageDraw) -> None:
+        c = self.colors
         cw = self._CONTENT_W
 
         # Title
-        draw.text((15, 20), "Power", fill=COL_YELLOW, font=self._font)
-        draw.line([(5, 36), (cw - 5, 36)], fill=COL_GREY)
+        draw.text((15, 20), "Power", fill=c["yellow"], font=self._font)
+        draw.line([(5, 36), (cw - 5, 36)], fill=c["grey"])
 
         opts = ["Shutdown", "Reboot"]
         for i, label in enumerate(opts):
             y = 48 + i * 25
             if i == self.power_selection:
                 draw.rectangle([(4, y - 2), (cw - 4, y + 16)],
-                               fill=COL_HIGHLIGHT)
-                draw.text((10, y), f"> {label}", fill=COL_TEXT, font=self._font)
+                               fill=c["highlight"])
+                draw.text((10, y), f"> {label}", fill=c["text"], font=self._font)
             else:
-                draw.text((10, y), f"  {label}", fill=COL_GREY, font=self._font)
+                draw.text((10, y), f"  {label}", fill=c["grey"], font=self._font)
 
         # Hint
-        draw.text((4, 108), "Press to confirm", fill=COL_GREY, font=self._font_sm)
+        draw.text((4, 108), "Press to confirm", fill=c["grey"], font=self._font_sm)
 
         # Soft keys: back | lock | (none)
         self._draw_softkeys(draw, "back", "lock", "")
@@ -1238,22 +1214,23 @@ class DisplayApp:
     # ── network menu ───────────────────────────────────────────────────────
 
     def _draw_network_menu(self, draw: ImageDraw.ImageDraw) -> None:
+        c = self.colors
         cw = self._CONTENT_W
 
         # Title
-        draw.text((10, 2), "WiFi Networks", fill=COL_YELLOW, font=self._font)
-        draw.line([(5, 17), (cw - 5, 17)], fill=COL_GREY)
+        draw.text((10, 2), "WiFi Networks", fill=c["yellow"], font=self._font)
+        draw.line([(5, 17), (cw - 5, 17)], fill=c["grey"])
 
         if self._net_connecting:
             name = self._net_list[self._net_selection][0] if self._net_list else ""
-            draw.text((10, 50), "Connecting...", fill=COL_YELLOW, font=self._font)
-            draw.text((10, 68), name[:16], fill=COL_TEXT, font=self._font_sm)
+            draw.text((10, 50), "Connecting...", fill=c["yellow"], font=self._font)
+            draw.text((10, 68), name[:16], fill=c["text"], font=self._font_sm)
             self._draw_softkeys(draw, "back", "lock", "")
             return
 
         if not self._net_list:
-            draw.text((10, 50), "No networks", fill=COL_GREY, font=self._font)
-            draw.text((10, 66), "found", fill=COL_GREY, font=self._font)
+            draw.text((10, 50), "No networks", fill=c["grey"], font=self._font)
+            draw.text((10, 66), "found", fill=c["grey"], font=self._font)
             self._draw_softkeys(draw, "back", "lock", "")
             return
 
@@ -1265,7 +1242,7 @@ class DisplayApp:
 
         # Scroll indicator top
         if self._net_scroll > 0:
-            draw.text((cw - 15, y_start - 2), "\u25B2", fill=COL_GREY,
+            draw.text((cw - 15, y_start - 2), "\u25B2", fill=c["grey"],
                       font=self._font_xs)
 
         for idx in range(self._net_scroll, end):
@@ -1285,23 +1262,23 @@ class DisplayApp:
 
             if selected:
                 draw.rectangle([(2, y - 1), (cw - 2, y + row_h - 3)],
-                               fill=COL_HIGHLIGHT)
+                               fill=c["highlight"])
                 prefix = ">"
             else:
                 prefix = " "
 
-            col = COL_GREEN if connected else COL_TEXT
-            draw.text((4, y), prefix, fill=COL_TEXT, font=self._font_sm)
+            col = c["green"] if connected else c["text"]
+            draw.text((4, y), prefix, fill=c["text"], font=self._font_sm)
             draw.text((12, y), display_name, fill=col, font=self._font_sm)
 
         # Scroll indicator bottom
         if end < len(self._net_list):
             draw.text((cw - 15, y_start + max_visible * row_h - 4),
-                      "\u25BC", fill=COL_GREY, font=self._font_xs)
+                      "\u25BC", fill=c["grey"], font=self._font_xs)
 
         # Hint
         draw.text((4, 114), "Green = connected",
-                  fill=COL_GREY, font=self._font_xs)
+                  fill=c["grey"], font=self._font_xs)
 
         # Soft keys: back | lock | (none)
         self._draw_softkeys(draw, "back", "lock", "")
@@ -1309,17 +1286,18 @@ class DisplayApp:
     # ── ownship aircraft screen ──────────────────────────────────────────
 
     def _draw_ownship_menu(self, draw: ImageDraw.ImageDraw) -> None:
+        c = self.colors
         cw = self._CONTENT_W
 
         # Title
-        draw.text((10, 2), "Ownship", fill=COL_YELLOW, font=self._font)
-        draw.line([(5, 17), (cw - 5, 17)], fill=COL_GREY)
+        draw.text((10, 2), "Ownship", fill=c["yellow"], font=self._font)
+        draw.line([(5, 17), (cw - 5, 17)], fill=c["grey"])
 
         # Build display list: optionally "Reset" row + aircraft
         rows: list[tuple[str, str, tuple]] = []  # (left_text, right_text, colour)
         if self._own_has_lock:
             rows.append(
-                (f"\u2718 {self._own_lock_label[:10]}", "Reset", COL_RED)
+                (f"\u2718 {self._own_lock_label[:10]}", "Reset", c["red"])
             )
 
         for ac in self._own_list:
@@ -1328,10 +1306,10 @@ class DisplayApp:
                 dist_str = f"{ac['dist_nm']:.1f}nm"
             else:
                 dist_str = ""
-            rows.append((cs, dist_str, COL_TEXT))
+            rows.append((cs, dist_str, c["text"]))
 
         if not rows:
-            draw.text((10, 50), "No aircraft", fill=COL_GREY, font=self._font)
+            draw.text((10, 50), "No aircraft", fill=c["grey"], font=self._font)
             self._draw_softkeys(draw, "back", "lock", "")
             return
 
@@ -1341,7 +1319,7 @@ class DisplayApp:
         end = min(self._own_scroll + max_visible, len(rows))
 
         if self._own_scroll > 0:
-            draw.text((cw - 15, y_start - 2), "\u25B2", fill=COL_GREY,
+            draw.text((cw - 15, y_start - 2), "\u25B2", fill=c["grey"],
                       font=self._font_xs)
 
         for idx in range(self._own_scroll, end):
@@ -1351,24 +1329,24 @@ class DisplayApp:
 
             if selected:
                 draw.rectangle([(2, y - 1), (cw - 2, y + row_h - 3)],
-                               fill=COL_HIGHLIGHT)
+                               fill=c["highlight"])
 
             prefix = ">" if selected else " "
-            draw.text((4, y), prefix, fill=COL_TEXT, font=self._font_sm)
+            draw.text((4, y), prefix, fill=c["text"], font=self._font_sm)
             draw.text((12, y), left, fill=col, font=self._font_sm)
             # Right-align distance
             if right:
                 rw = self._font_xs.getlength(right) if hasattr(self._font_xs, 'getlength') else len(right) * 6 # type: ignore
                 draw.text((int(cw - rw - 4), y + 1), right,
-                          fill=COL_GREY if col != COL_RED else COL_RED,
+                          fill=c["grey"] if col != c["red"] else c["red"],
                           font=self._font_xs)
 
         if end < len(rows):
             draw.text((cw - 15, y_start + max_visible * row_h - 4),
-                      "\u25BC", fill=COL_GREY, font=self._font_xs)
+                      "\u25BC", fill=c["grey"], font=self._font_xs)
 
         draw.text((4, 114), "Press to select",
-                  fill=COL_GREY, font=self._font_xs)
+                  fill=c["grey"], font=self._font_xs)
 
         self._draw_softkeys(draw, "back", "lock", "")
 
@@ -1376,11 +1354,14 @@ class DisplayApp:
 
     _DIAMOND_SIZE = 3                    # half-size of traffic diamond
 
-    _BAND_COLOURS: dict[str, tuple] = {
-        "red": COL_BAND_RED,
-        "yellow": COL_BAND_YELLOW,
-        "white": COL_TEXT,
-    }
+    def _band_colour(self, band: str) -> tuple:
+        """Return the colour for a radar distance band."""
+        c = self.colors
+        if band == "red":
+            return c["red"]
+        if band == "yellow":
+            return c["yellow"]
+        return c["text"]
 
     def _read_radar_json(self) -> dict | None:
         try:
@@ -1390,6 +1371,7 @@ class DisplayApp:
             return None
 
     def _draw_radar(self, draw: ImageDraw.ImageDraw) -> None:
+        c = self.colors
         cx = LCD_WIDTH // 2
         cy = LCD_HEIGHT // 2
         r = 60                               # usable radius in pixels
@@ -1399,28 +1381,28 @@ class DisplayApp:
         # Range ring at 5 nm (half of 10 nm full radius)
         draw.ellipse(
             [(cx - ring_r, cy - ring_r), (cx + ring_r, cy + ring_r)],
-            outline=COL_RADAR_RING,
+            outline=c["ring"],
         )
         # Outer boundary (10 nm)
         draw.ellipse(
             [(cx - r, cy - r), (cx + r, cy + r)],
-            outline=COL_RADAR_RING,
+            outline=c["ring"],
         )
 
         # Cross-hair lines
-        draw.line([(cx, cy - r), (cx, cy + r)], fill=COL_RADAR_RING)
-        draw.line([(cx - r, cy), (cx + r, cy)], fill=COL_RADAR_RING)
+        draw.line([(cx, cy - r), (cx, cy + r)], fill=c["ring"])
+        draw.line([(cx - r, cy), (cx + r, cy)], fill=c["ring"])
 
         # Range labels
-        draw.text((cx + ring_r + 1, cy - 4), "5", fill=COL_GREY, font=self._font_xs)
-        draw.text((cx + r + 1, cy - 4), "10", fill=COL_GREY, font=self._font_xs)
+        draw.text((cx + ring_r + 1, cy - 4), "5", fill=c["grey"], font=self._font_xs)
+        draw.text((cx + r + 1, cy - 4), "10", fill=c["grey"], font=self._font_xs)
 
         # North indicator
-        draw.text((cx - 3, 1), "N", fill=COL_GREY, font=self._font_xs)
+        draw.text((cx - 3, 1), "N", fill=c["grey"], font=self._font_xs)
 
         radar = self._read_radar_json()
         if radar is None or not radar.get("has_fix"):
-            draw.text((cx - 25, cy - 5), "NO GPS", fill=COL_RED, font=self._font)
+            draw.text((cx - 25, cy - 5), "NO GPS", fill=c["red"], font=self._font)
             return
 
         own_track = radar.get("ownship_track") or 0.0
@@ -1428,7 +1410,7 @@ class DisplayApp:
         # Ownship marker (small filled circle)
         draw.ellipse(
             [(cx - 2, cy - 2), (cx + 2, cy + 2)],
-            fill=COL_RADAR_OWN,
+            fill=c["own"],
         )
 
         # Traffic diamonds
@@ -1449,7 +1431,7 @@ class DisplayApp:
             tx = max(ds, min(LCD_WIDTH - 1 - ds, tx))
             ty = max(ds, min(LCD_HEIGHT - 1 - ds, ty))
 
-            col = self._BAND_COLOURS.get(band, COL_TEXT)
+            col = self._band_colour(band)
             ix, iy = int(tx), int(ty)
 
             # Diamond shape (4 points)
@@ -1468,13 +1450,13 @@ class DisplayApp:
         # Lock indicator — small icon at bottom-right corner
         if self.locked:
             draw.text((LCD_WIDTH - 12, LCD_HEIGHT - 12), "\U0001F512",
-                      fill=COL_RED, font=self._icon_font_sm)
+                      fill=c["red"], font=self._icon_font_sm)
 
     def _render(self) -> None:
         if self._countdown_active:
             return
 
-        img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), COL_BG)
+        img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), self.colors["bg"])
         draw = ImageDraw.Draw(img)
 
         if self.screen == SCREEN_STATUS:
