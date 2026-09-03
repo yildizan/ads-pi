@@ -84,6 +84,8 @@ REFRESH_INTERVAL = 3.0   # seconds between idle redraws
 DEBOUNCE_MS      = 500   # milliseconds for buttons
 DEBOUNCE_JOY_MS  = 400   # milliseconds for joystick (longer to avoid double-step)
 COUNTDOWN_SECS   = 3
+SCREENSHOT_HOLD  = 2.0   # seconds to hold KEY2 for screenshot
+SCREENSHOT_DIR   = "/home/yildizan/screenshots"
 
 # ---------------------------------------------------------------------------
 # ST7735S commands
@@ -538,6 +540,10 @@ class DisplayApp:
         # Debounce timestamps per pin
         self._last_press: dict[int, float] = {p: 0.0 for p in ALL_INPUT_PINS}
 
+        # KEY2 long-press tracking for screenshot
+        self._key2_down_since: float = 0.0
+        self._key2_screenshot_fired: bool = False
+
         # Font — try DejaVu first, fall back to default
         self._font = None
         self._font_sm = None
@@ -612,11 +618,23 @@ class DisplayApp:
 
     def _poll_input(self) -> None:
         """Poll all inputs once. Must be called in a tight loop."""
-        # KEY2 = Lock/Unlock always works
-        if self._debounced(PIN_KEY2):
-            self.locked = not self.locked
-            self._redraw_event.set()
-            return
+        # KEY2 = Lock/Unlock (short press) or Screenshot (long press ≥2s)
+        key2_pressed = GPIO.input(PIN_KEY2) == 0  # active LOW
+        if key2_pressed:
+            if self._key2_down_since == 0.0:
+                self._key2_down_since = time.time()
+            elif (not self._key2_screenshot_fired
+                  and time.time() - self._key2_down_since >= SCREENSHOT_HOLD):
+                self._key2_screenshot_fired = True
+                self.save_screenshot()
+                self._redraw_event.set()
+        else:
+            if self._key2_down_since > 0.0 and not self._key2_screenshot_fired:
+                # Short press → toggle lock
+                self.locked = not self.locked
+                self._redraw_event.set()
+            self._key2_down_since = 0.0
+            self._key2_screenshot_fired = False
 
         # Everything else blocked when locked
         if self.locked:
@@ -1480,11 +1498,26 @@ class DisplayApp:
         self.lcd.show_image(img)
 
     def save_screenshot(self) -> None:
-        """Save the last rendered frame to /tmp/adsb-display-screenshot.png."""
+        """Save the last rendered frame to ~/screenshots/ with a timestamp."""
         if self._last_frame is not None:
-            path = "/tmp/adsb-display-screenshot.png"
+            os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+            stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+            path = os.path.join(SCREENSHOT_DIR, f"adsb-{stamp}.png")
             self._last_frame.save(path)
             log.info("Screenshot saved to %s", path)
+            self._show_screenshot_notification()
+
+    def _show_screenshot_notification(self) -> None:
+        """Show a brief 'Screenshot saved!' overlay, then resume."""
+        self._countdown_active = True
+        c = self.colors
+        img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), c["bg"])
+        draw = ImageDraw.Draw(img)
+        draw.text((10, 55), "Screenshot saved!", fill=c["green"], font=self._font)
+        self.lcd.show_image(img)
+        time.sleep(1.0)
+        self._countdown_active = False
+        self._redraw_event.set()
 
     # ── main loops ─────────────────────────────────────────────────────────
 
@@ -1543,11 +1576,6 @@ def _signal_handler(sig, frame):
         _app._running = False
 
 
-def _screenshot_handler(sig, frame):
-    if _app:
-        _app.save_screenshot()
-
-
 def main() -> None:
     global _app
     logging.basicConfig(
@@ -1557,7 +1585,6 @@ def main() -> None:
     )
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGUSR1, _screenshot_handler) # type: ignore
     _app = DisplayApp()
     _app.run()
 
