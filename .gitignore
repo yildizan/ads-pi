@@ -7,6 +7,7 @@ screenshots/
 
 # Optional local copies of private runtime configuration
 ads-pi.conf
+adsb-radar.service
 .env
 .env.*
 !.env.example
