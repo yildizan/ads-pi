@@ -31,7 +31,7 @@ NMEA_HOST = "0.0.0.0"
 NMEA_UDP_PORT = 3999                # UDP port for NMEA from GPS2IP Lite
 OWNSHIP_JSON_PATH = "/tmp/ownship.json"
 
-# Ownship fallback position — used until first NMEA fix arrives
+# Synthetic ownship fallback position used until the first NMEA fix arrives
 _OWNSHIP_DEFAULT_LAT = 0.0
 _OWNSHIP_DEFAULT_LON = 0.0
 _OWNSHIP_DEFAULT_ALT = 0.0
