@@ -3,6 +3,7 @@ ADS-Pi shared configuration
 ============================
 Reads and writes /etc/ads-pi.conf (INI format).
 Used by display, radar, and GDL90 services.
+Keep device-specific or sensitive values in that external file, not in Git.
 """
 
 import configparser

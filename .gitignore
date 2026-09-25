@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+# Generated and device-local data
+aircraft.db
+screenshots/
+
+# Optional local copies of private runtime configuration
+ads-pi.conf
+.env
+.env.*
+!.env.example
