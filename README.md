@@ -104,8 +104,8 @@ callsign =
 ```
 
 Set `ownship.icao` and `ownship.callsign` only when you want to identify one
-aircraft from the `readsb` feed as ownship. Keep device-specific or sensitive
-values in this external file rather than committing them to Git.
+aircraft from the `readsb` feed as ownship. Ownship is normally selected by
+the user through the display UI, which saves these values automatically.
 
 The bridge uses a synthetic `0.0, 0.0, 0 ft` position until it receives a
 valid NMEA fix.
@@ -144,11 +144,7 @@ excluded from Git.
 - `configuration.py` - shared external configuration handling
 
 ## Privacy and safety
-
-- Do not commit `/etc/ads-pi.conf`, `.env` files, screenshots, generated
-  databases, Wi-Fi details, aircraft identifiers, or real fallback locations.
-- Review captured images before publishing them.
-- This is an experimental, do-it-yourself project. Do not use it as the sole
+This is an experimental, do-it-yourself project. Do not use it as the sole
   source of traffic awareness, navigation, or collision avoidance.
 
 ## License
