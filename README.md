@@ -34,14 +34,18 @@ The project also includes a radar processor and a driver for the Waveshare
 
 ## Data flow
 
-```text
-SDR -> readsb -> /run/readsb/aircraft.json -> bridge.py -> GDL90 UDP :4000
-Phone or GPS -> NMEA UDP :3999 -----------^
-                                      |
-                                      +-> /tmp/ownship.json
-                                          -> radar.py
-                                          -> /tmp/radar.json
-                                          -> display.py
+```mermaid
+flowchart LR
+    SDR["1090 MHz SDR"] --> readsb
+    readsb --> aircraft["/run/readsb/aircraft.json"]
+    aircraft --> bridge["bridge.py"]
+    GPS["Phone or GPS"] -->|"NMEA UDP :3999"| bridge
+    bridge -->|"GDL90 UDP :4000"| EFB["EFB / navigation app"]
+    bridge --> ownship["/tmp/ownship.json"]
+    aircraft --> radar["radar.py"]
+    ownship --> radar
+    radar --> radarData["/tmp/radar.json"]
+    radarData --> display["display.py"]
 ```
 
 ## Hardware
